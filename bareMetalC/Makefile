@@ -14,6 +14,9 @@ tests = \
 	matmul_os \
 	matmul_ws \
 	matmul \
+	mxint8_golden \
+	mxint8_matmul_dim32 \
+	mxint8_corner \
 	matmul_spad \
 	raw_hazard \
 	aligned \
@@ -79,7 +82,7 @@ else
 endif
 
 BENCH_COMMON = $(abs_top_srcdir)/riscv-tests/benchmarks/common
-GEMMINI_HEADERS = $(abs_top_srcdir)/include/gemmini.h $(abs_top_srcdir)/include/gemmini_params.h $(abs_top_srcdir)/include/gemmini_testutils.h
+GEMMINI_HEADERS = $(abs_top_srcdir)/include/gemmini.h $(abs_top_srcdir)/include/gemmini_params.h $(abs_top_srcdir)/include/gemmini_testutils.h $(abs_top_srcdir)/include/mxint8_golden.h $(abs_top_srcdir)/include/mxint8_pack.h
 
 CFLAGS := $(CFLAGS) \
 	-DPREALLOCATE=1 \
@@ -134,4 +137,3 @@ run-baremetal: $(runs_baremetal)
 	$(RUNNER)$(abs_top_srcdir)/build/bareMetalC/$^
 
 junk += $(tests_baremetal) $(tests_linux) $(tests_pk)
-

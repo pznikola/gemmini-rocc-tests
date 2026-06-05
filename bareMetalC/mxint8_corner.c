@@ -1,0 +1,246 @@
+// See LICENSE for license details.
+//
+// MXINT8 DIM=32 corner cases (single full output tile, M = N = DIM).
+//
+// Reuses the untransposed weight-stationary manual sequence from
+// mxint8_matmul_dim32.c, with full-width int32 accumulator output, and diffs the
+// hardware against the bit-exact golden `mxint8_ref_gemm_acc`. All inputs are set
+// up directly as integers (no fp packer), so the cases are cheap on the core.
+//
+// Cases: all-zero payloads; max +127 and -127 payloads with shifts that saturate
+// the int32 accumulator (int32-range and 64-bit-overflow regimes — exercises the
+// R2-2 scalePowerOfTwo/saturate path); alternating signs with small scales
+// (negative shift ⇒ nearest-even right-shift rounding); random valid exponents
+// (mixed positive/negative shifts); K-tail (K=40, second block only 8 valid K
+// lanes, the rest zero-padded — exercises tail masking); and a golden-only
+// 0xff-reject check (loading 0xff into hardware would fire the MXScaleSRAM assert).
+//
+// Build prerequisite: compile against gemmini_params_mxint8_dim32.h (MX_ENABLED=1).
+// Scope: single output tile (M = N = DIM); partial M/N tiles are a later case.
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <stdio.h>
+#ifndef BAREMETAL
+#include <sys/mman.h>
+#endif
+#include "include/gemmini_testutils.h"
+#include "include/mxint8_golden.h"
+#include "include/mxint8_pack.h"
+
+#if !MX_ENABLED
+
+int main() {
+  printf("MX disabled in this build (need gemmini_params_mxint8_dim32.h); skipping\n");
+  exit(0);
+}
+
+#else
+
+#define M DIM
+#define N DIM
+#define K_MAX 64
+#define KB_MAX (K_MAX / MX_BLOCK_SIZE)
+
+static uint32_t lcg = 0x13579bdfu;
+static int rnd(int lo, int hi) { // uniform int in [lo, hi]
+  lcg = lcg * 1664525u + 1013904223u;
+  return lo + (int)((lcg >> 9) % (uint32_t)(hi - lo + 1));
+}
+
+static elem_t a_payload[M][K_MAX] row_align(1);
+static elem_t b_payload[K_MAX][N] row_align(1);
+static mx_scale_t a_scale[M][KB_MAX] __attribute__((aligned(64)));
+static mx_scale_t b_scale[KB_MAX][N] __attribute__((aligned(64)));
+static acc_t c_hw[M][N] row_align(1);
+static acc_t gold[M][N];
+
+static void mxint8_hw_matmul(size_t k, size_t kb) {
+  const uint32_t acc_base = (1u << (ADDR_LEN - 1)) | (1u << (ADDR_LEN - 3));
+  const uint32_t acc_accum = (1u << (ADDR_LEN - 2));
+  const uint32_t a_sp = 0;
+  const uint32_t b_sp = KB_MAX * DIM;
+
+  gemmini_flush(0);
+  gemmini_config_mxint8(true, 0);
+  gemmini_config_ex(WEIGHT_STATIONARY, 0, 0);
+  gemmini_config_st(DIM * sizeof(acc_t));
+  gemmini_mvin_mxscale_a(&a_scale[0][0], 0, M, kb, KB_MAX);
+  gemmini_mvin_mxscale_b(&b_scale[0][0], MX_SCALE_SP_ROWS / 2, kb, N, N);
+
+  gemmini_config_ld(K_MAX * sizeof(elem_t));
+  for (size_t b = 0; b < kb; b++) {
+    gemmini_mvin(&a_payload[0][b * MX_BLOCK_SIZE], a_sp + b * DIM);
+  }
+  gemmini_config_ld(N * sizeof(elem_t));
+  for (size_t b = 0; b < kb; b++) {
+    gemmini_mvin(&b_payload[b * MX_BLOCK_SIZE][0], b_sp + b * DIM);
+  }
+  for (size_t b = 0; b < kb; b++) {
+    const uint32_t c_addr = acc_base | (b == 0 ? 0u : acc_accum);
+    gemmini_preload(b_sp + b * DIM, c_addr);
+    gemmini_compute_preloaded(a_sp + b * DIM, GARBAGE_ADDR);
+  }
+  gemmini_mvout(&c_hw[0][0], acc_base);
+  gemmini_fence();
+}
+
+// Zero everything, then a case fills the valid region. Zeroing the K-tail
+// padding lets the full-DIM block mvin carry exact zeros past the valid K.
+static void clear_inputs(void) {
+  for (size_t i = 0; i < M; i++) {
+    for (size_t kk = 0; kk < K_MAX; kk++) { a_payload[i][kk] = 0; }
+    for (size_t b = 0; b < KB_MAX; b++) { a_scale[i][b] = mxint8_e8m0_encode(0); }
+  }
+  for (size_t kk = 0; kk < K_MAX; kk++) {
+    for (size_t j = 0; j < N; j++) { b_payload[kk][j] = 0; }
+  }
+  for (size_t b = 0; b < KB_MAX; b++) {
+    for (size_t j = 0; j < N; j++) { b_scale[b][j] = mxint8_e8m0_encode(0); }
+  }
+}
+
+static int check(const char *label, size_t k, size_t kb) {
+  const int rc = mxint8_ref_gemm_acc(&a_payload[0][0], &b_payload[0][0],
+                                     &a_scale[0][0], &b_scale[0][0], &gold[0][0],
+                                     M, N, k, K_MAX, N, N, KB_MAX, N);
+  if (rc != 0) {
+    printf("%-10s K=%d: golden rc=%d (unexpected)\n", label, (int)k, rc);
+    return 1;
+  }
+  mxint8_hw_matmul(k, kb);
+  int mism = 0, fi = -1, fj = -1;
+  for (size_t i = 0; i < M; i++) {
+    for (size_t j = 0; j < N; j++) {
+      if (c_hw[i][j] != gold[i][j]) {
+        if (fi < 0) { fi = (int)i; fj = (int)j; }
+        mism++;
+      }
+    }
+  }
+  if (mism) {
+    printf("%-10s K=%d: FAIL %d mism; first [%d][%d] hw=%d gold=%d\n",
+           label, (int)k, mism, fi, fj, (int)c_hw[fi][fj], (int)gold[fi][fj]);
+    return 1;
+  }
+  printf("%-10s K=%d: PASS (c[0][0]=%d c[1][2]=%d)\n",
+         label, (int)k, (int)c_hw[0][0], (int)c_hw[1][2]);
+  return 0;
+}
+
+static int case_zero(void) {
+  clear_inputs();           // all payloads 0, scales valid ⇒ C must be all 0
+  return check("zero", MX_BLOCK_SIZE, 1);
+}
+
+// Uniform payloads (A=`av`, B=`bv`), uniform scales eA=eB=ex ⇒ shift = 2*ex-12.
+// raw = k*av*bv; with a large shift this saturates the int32 accumulator (sign of
+// av*bv selects INT32_MAX vs INT32_MIN).
+static int case_saturate(const char *label, elem_t av, elem_t bv, int ex) {
+  clear_inputs();
+  for (size_t i = 0; i < M; i++) {
+    for (size_t kk = 0; kk < MX_BLOCK_SIZE; kk++) { a_payload[i][kk] = av; }
+    a_scale[i][0] = mxint8_e8m0_encode(ex);
+  }
+  for (size_t kk = 0; kk < MX_BLOCK_SIZE; kk++) {
+    for (size_t j = 0; j < N; j++) { b_payload[kk][j] = bv; }
+  }
+  for (size_t j = 0; j < N; j++) { b_scale[0][j] = mxint8_e8m0_encode(ex); }
+  return check(label, MX_BLOCK_SIZE, 1);
+}
+
+static int case_altsign_round(void) {
+  clear_inputs();
+  // Alternating-sign payloads, small scales (eA=eB=2 ⇒ shift = -8: a nearest-even
+  // right shift), so the per-block rounding path is exercised.
+  for (size_t i = 0; i < M; i++) {
+    for (size_t kk = 0; kk < MX_BLOCK_SIZE; kk++) {
+      a_payload[i][kk] = ((i + kk) & 1) ? -100 : 100;
+    }
+    a_scale[i][0] = mxint8_e8m0_encode(2);
+  }
+  for (size_t kk = 0; kk < MX_BLOCK_SIZE; kk++) {
+    for (size_t j = 0; j < N; j++) { b_payload[kk][j] = ((kk + j) & 1) ? -123 : 123; }
+  }
+  for (size_t j = 0; j < N; j++) { b_scale[0][j] = mxint8_e8m0_encode(2); }
+  return check("altsign", MX_BLOCK_SIZE, 1);
+}
+
+static int case_random_exp(void) {
+  clear_inputs();
+  // Random int8 payloads + random valid E8M0 exponents in [-18,18] ⇒ a spread of
+  // positive and negative shifts (eA+eB-12 ranges over [-48,24]).
+  for (size_t i = 0; i < M; i++) {
+    for (size_t kk = 0; kk < MX_BLOCK_SIZE; kk++) { a_payload[i][kk] = (elem_t)rnd(-127, 127); }
+    a_scale[i][0] = mxint8_e8m0_encode(rnd(-18, 18));
+  }
+  for (size_t kk = 0; kk < MX_BLOCK_SIZE; kk++) {
+    for (size_t j = 0; j < N; j++) { b_payload[kk][j] = (elem_t)rnd(-127, 127); }
+  }
+  for (size_t j = 0; j < N; j++) { b_scale[0][j] = mxint8_e8m0_encode(rnd(-18, 18)); }
+  return check("randexp", MX_BLOCK_SIZE, 1);
+}
+
+static int case_ktail(void) {
+  clear_inputs();
+  // K = 40: block 0 full (32 lanes), block 1 has 8 valid K lanes [32,40) and the
+  // rest zero-padded (clear_inputs already zeroed [40,64)). Per-block scales differ.
+  const size_t k = 40, kb = 2;
+  for (size_t i = 0; i < M; i++) {
+    for (size_t kk = 0; kk < k; kk++) { a_payload[i][kk] = (elem_t)rnd(-127, 127); }
+    a_scale[i][0] = mxint8_e8m0_encode(rnd(-6, 6));
+    a_scale[i][1] = mxint8_e8m0_encode(rnd(-6, 6));
+  }
+  for (size_t kk = 0; kk < k; kk++) {
+    for (size_t j = 0; j < N; j++) { b_payload[kk][j] = (elem_t)rnd(-127, 127); }
+  }
+  for (size_t j = 0; j < N; j++) {
+    b_scale[0][j] = mxint8_e8m0_encode(rnd(-6, 6));
+    b_scale[1][j] = mxint8_e8m0_encode(rnd(-6, 6));
+  }
+  return check("ktail", k, kb);
+}
+
+// 0xff (E8M0 NaN) is rejected: the golden returns -1, and loading it into the
+// MXScaleSRAM would fire a hardware assert, so this is checked software-only.
+static int case_nan_reject(void) {
+  clear_inputs();
+  for (size_t i = 0; i < M; i++) { a_payload[i][0] = 1; }
+  for (size_t j = 0; j < N; j++) { b_payload[0][j] = 1; }
+  a_scale[3][0] = (mx_scale_t)0xff;
+  const int rc = mxint8_ref_gemm_acc(&a_payload[0][0], &b_payload[0][0],
+                                     &a_scale[0][0], &b_scale[0][0], &gold[0][0],
+                                     M, N, MX_BLOCK_SIZE, K_MAX, N, N, KB_MAX, N);
+  const int ok = (rc == -1);
+  printf("nan_reject K=32: %s (golden rc=%d, expected -1)\n", ok ? "PASS" : "FAIL", rc);
+  return ok ? 0 : 1;
+}
+
+int main() {
+#ifndef BAREMETAL
+  if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+    perror("mlockall failed");
+    exit(1);
+  }
+#endif
+
+  int bad = 0;
+  bad |= case_zero();
+  bad |= case_saturate("max_pos32", 127, 127, 13);  // shift 14, +raw ⇒ INT32_MAX
+  bad |= case_saturate("max_neg32", 127, -127, 13); // shift 14, -raw ⇒ INT32_MIN
+  bad |= case_saturate("max_pos64", 127, 127, 31);  // shift 50: 64-bit-overflow path ⇒ INT32_MAX
+  bad |= case_altsign_round();
+  bad |= case_random_exp();
+  bad |= case_ktail();
+  bad |= case_nan_reject();
+
+  if (bad) {
+    printf("mxint8_corner: FAIL\n");
+    exit(1);
+  }
+  printf("mxint8_corner: PASS\n");
+  exit(0);
+}
+
+#endif // MX_ENABLED

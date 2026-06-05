@@ -60,11 +60,19 @@
 #define k_MVOUT_SPAD 23
 #define k_LOOP_WS_CONFIG_SPAD_AB 24
 #define k_LOOP_WS_CONFIG_SPAD_C 25
+#define k_CONFIG_MXINT8 26
+#define k_MVIN_MXSCALE_A 27
+#define k_MVIN_MXSCALE_B 28
+#define k_LOOP_WS_MXINT8 29
 
 #define CONFIG_EX 0
 #define CONFIG_LD 1
 #define CONFIG_ST 2
 #define CONFIG_BERT 3
+
+#define MX_CONFIG_SET_STRIDE 0x2
+#define MX_CONFIG_STRIDE_IS_B 0x4
+#define MX_CONFIG_RESET_K 0x8
 
 #define GARBAGE_ADDR ((uint32_t)(-1))
 #define OUTPUT_STATIONARY 0
@@ -204,6 +212,53 @@ static acc_scale_t_bits acc_scale_t_to_acc_scale_t_bits(acc_scale_t x) {
 
 #define ROCC_INSTRUCTION_RS1_RS2(x, rs1, rs2, funct) \
   ROCC_INSTRUCTION_0_R_R(x, rs1, rs2, funct)
+
+_STATIC void gemmini_config_mxint8(bool enable, uint32_t flags) {
+#if MX_ENABLED
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)flags << 8) | MX_CONFIG_RESET_K | (uint64_t)(enable != 0), 0, k_CONFIG_MXINT8);
+#else
+  (void)enable;
+  (void)flags;
+#endif
+}
+
+_STATIC void gemmini_mvin_mxscale_a(const mx_scale_t *scale_ptr,
+                                    uint32_t local_scale_addr,
+                                    size_t rows,
+                                    size_t k_blocks,
+                                    size_t stride) {
+#if MX_ENABLED
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, MX_CONFIG_SET_STRIDE | 1, stride, k_CONFIG_MXINT8);
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, scale_ptr,
+      ((uint64_t)rows << (ADDR_LEN + 16)) | ((uint64_t)k_blocks << ADDR_LEN) | local_scale_addr,
+      k_MVIN_MXSCALE_A);
+#else
+  (void)scale_ptr;
+  (void)local_scale_addr;
+  (void)rows;
+  (void)k_blocks;
+  (void)stride;
+#endif
+}
+
+_STATIC void gemmini_mvin_mxscale_b(const mx_scale_t *scale_ptr,
+                                    uint32_t local_scale_addr,
+                                    size_t k_blocks,
+                                    size_t cols,
+                                    size_t stride) {
+#if MX_ENABLED
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, MX_CONFIG_SET_STRIDE | MX_CONFIG_STRIDE_IS_B | 1, stride, k_CONFIG_MXINT8);
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, scale_ptr,
+      ((uint64_t)k_blocks << (ADDR_LEN + 16)) | ((uint64_t)cols << ADDR_LEN) | local_scale_addr,
+      k_MVIN_MXSCALE_B);
+#else
+  (void)scale_ptr;
+  (void)local_scale_addr;
+  (void)k_blocks;
+  (void)cols;
+  (void)stride;
+#endif
+}
 
 // mvin and mvout
 #define gemmini_extended_mvin(dram_addr, spad_addr, cols, rows) \
@@ -379,6 +434,43 @@ static int ceil_divide_int(int a, int b){
     ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, A, B, k_LOOP_WS_CONFIG_SPAD_AB) \
     ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)(a_spad_id) << 18) | ((uint64_t)(b_spad_id) << 16) | ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (ex_accumulate), ((uint64_t)(C) << 32) | 0x200U | (skips) | ((is_resadd) << 2) | ((B_transpose) << 1) | (A_transpose), k_LOOP_WS) \
   }
+
+_STATIC void gemmini_loop_ws_mxint8(size_t I, size_t J, size_t K,
+                                    size_t pad_I, size_t pad_J, size_t pad_K,
+                                    const elem_t *A_payload,
+                                    const elem_t *B_payload,
+                                    const void *D,
+                                    void *C,
+                                    const mx_scale_t *A_scale,
+                                    const mx_scale_t *B_scale,
+                                    size_t A_stride,
+                                    size_t B_stride,
+                                    size_t D_stride,
+                                    size_t C_stride,
+                                    size_t A_scale_stride,
+                                    size_t B_scale_stride,
+                                    bool A_transpose,
+                                    bool B_transpose,
+                                    bool full_C,
+                                    bool low_D,
+                                    bool ex_accumulate,
+                                    int act,
+                                    int a_spad_id,
+                                    int b_spad_id,
+                                    bool is_resadd) {
+  const size_t k_blocks = (K + MX_BLOCK_SIZE - 1) / MX_BLOCK_SIZE;
+
+  gemmini_config_mxint8(true, 0);
+  gemmini_mvin_mxscale_a(A_scale, 0, I, k_blocks, A_scale_stride);
+  gemmini_mvin_mxscale_b(B_scale, MX_SCALE_SP_ROWS / 2, k_blocks, J, B_scale_stride);
+
+  gemmini_loop_ws(I, J, K, pad_I, pad_J, pad_K,
+                  A_payload, B_payload, D, C,
+                  A_stride, B_stride, D_stride, C_stride,
+                  A_transpose, B_transpose,
+                  full_C, low_D, ex_accumulate, act,
+                  a_spad_id, b_spad_id, is_resadd);
+}
 
 // weight-stationary conv loop
 #define gemmini_loop_conv_ws(batch_size, in_row_dim, in_col_dim, in_channels, out_channels, out_row_dim, out_col_dim, pool_out_row_dim, pool_out_col_dim, stride, padding, kernel_dim, kernel_dilation, pool_size, pool_stride, pool_padding, batches, porows, pocols, pochs, krows, kcols, kchs, lpad, rpad, upad, dpad, plpad, prpad, pupad, pdpad, orows, ocols, weights, output, bias, input, no_bias, no_pool, downsample, wrot180, input_dilated, activation, trans_output_1203, trans_weight_1203, trans_weight_0132, trans_input_3120, max_pixels_per_row, in_stride, weight_stride, out_stride, dw, a_spad_id, b_spad_id) \
@@ -3614,4 +3706,3 @@ _STATIC void tiled_norm_auto(const size_t I, const size_t J,
 #undef abs
 
 #endif // SRC_MAIN_C_GEMMINI_H
-
