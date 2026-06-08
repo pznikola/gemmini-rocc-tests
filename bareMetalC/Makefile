@@ -18,6 +18,7 @@ tests = \
 	mxint8_matmul_dim32 \
 	mxint8_corner \
 	mxint8_matmul_partial \
+	mxint8_matmul_dim16 \
 	matmul_spad \
 	raw_hazard \
 	aligned \
