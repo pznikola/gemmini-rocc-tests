@@ -458,11 +458,34 @@ _STATIC void gemmini_loop_ws_mxint8(size_t I, size_t J, size_t K,
                                     int a_spad_id,
                                     int b_spad_id,
                                     bool is_resadd) {
-  const size_t k_blocks = (K + MX_BLOCK_SIZE - 1) / MX_BLOCK_SIZE;
+  // K is a count of DIM-wide tiles (exactly as `gemmini_loop_ws` consumes it), so the K
+  // *element* extent is K*DIM - pad_K; the MX block count is over those elements. (Using K
+  // directly here would treat tiles as elements and under-count the K blocks — e.g. 2 tiles
+  // at DIM=32 = 64 K-elements = 2 MX blocks, not ceil(2/32)=1.)
+  const size_t k_elems = K * DIM - pad_K;
+  const size_t k_blocks = (k_elems + MX_BLOCK_SIZE - 1) / MX_BLOCK_SIZE;
+
+  // MX v1 supports a single output tile only (I == J == 1, so M, N <= DIM). The A-scale
+  // read address is the output row (`output_counter`, 0..DIM-1) with no output-tile
+  // component, so issuing multiple output tiles would reuse one tile's scales. Multi-tile
+  // support needs an RTL scale-read-address tiling path (a later phase). Fail loudly rather
+  // than silently corrupt.
+  if (I != 1 || J != 1) {
+    printf("gemmini_loop_ws_mxint8: only a single output tile (I=J=1, M,N<=DIM) is supported "
+           "in MX v1; got I=%lu J=%lu\n", (unsigned long)I, (unsigned long)J);
+    exit(1);
+  }
+
+  // The scale mvins take ELEMENT counts, not tile counts: A-scale `rows` is the number of
+  // M output rows (= I*DIM - pad_I) and B-scale `cols` is the number of N output columns
+  // (= J*DIM - pad_J). `gemmini_loop_ws`'s I/J are tile iterators (the LoopMatmul unroller
+  // scales each by DIM internally), so passing I/J straight through under-counts the scales.
+  const size_t m_rows = I * DIM - pad_I;
+  const size_t n_cols = J * DIM - pad_J;
 
   gemmini_config_mxint8(true, 0);
-  gemmini_mvin_mxscale_a(A_scale, 0, I, k_blocks, A_scale_stride);
-  gemmini_mvin_mxscale_b(B_scale, MX_SCALE_SP_ROWS / 2, k_blocks, J, B_scale_stride);
+  gemmini_mvin_mxscale_a(A_scale, 0, m_rows, k_blocks, A_scale_stride);
+  gemmini_mvin_mxscale_b(B_scale, MX_SCALE_SP_ROWS / 2, k_blocks, n_cols, B_scale_stride);
 
   gemmini_loop_ws(I, J, K, pad_I, pad_J, pad_K,
                   A_payload, B_payload, D, C,
