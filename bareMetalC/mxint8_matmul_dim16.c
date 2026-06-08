@@ -16,22 +16,20 @@
 // the full 32-K block, then scales once). An exact match proves the two-phase raw
 // buffering and the once-per-logical-block scaling.
 //
-// Cases (all single logical block, K = MX_BLOCK_SIZE = 32 = two 16-wide phases):
-//   1. A deterministic "probe": all-ones payloads with per-row/col scales chosen
-//      so hw[i][j] = K << ((i%4)+(j%3)). Since the K=32 raw sum is accumulated
-//      from two 16-wide halves (16+16), an exact match directly distinguishes a
-//      correct two-phase sum from a broken one (which would yield 16<<shift).
-//   2/3. Randomized cases packed by `mxint8_pack.h` (two independent draws).
-//
-// Scope / known limitation: this test exercises a *single* logical MX block (one
-// 32-K block spanning two physical 16-wide K phases) — the core DIM=16 two-phase
-// contribution. Cross-block accumulation at DIM=16 (K > 32, multiple logical
-// blocks) additionally depends on draining the *last* weight-stationary compute
-// out of the systolic array before the mvout; at DIM=16 (with the MX one-cycle
-// output delay) the final block's compute is not fully clocked out by a trailing
-// mvout, so its contribution is dropped. That WS last-compute drain interaction is
-// orthogonal to the two-phase block-scaling novelty and is deferred (tracked with
-// the K=96/128 split runs). See DOCS_MX/PLAN_MX.md (R3 / M5).
+// Cases:
+//   1. Single-block "probe" (K=32): all-ones payloads with per-row/col scales chosen
+//      so hw[i][j] = K << ((i%4)+(j%3)). Since the K=32 raw sum is accumulated from
+//      two 16-wide halves (16+16), an exact match distinguishes a correct two-phase
+//      sum from a broken one (which would yield 16<<shift).
+//   2/3. Single-block randomized cases packed by `mxint8_pack.h` (two draws).
+//   4+. CROSS-BLOCK cases (K = 64/96/128 = 2/3/4 logical blocks): randomized draws
+//      plus deterministic cross-block probes (each block b carries its own B exponent
+//      eB=6+b, so block b contributes 32<<b and the accumulated result is sum_b 32<<b).
+//      These exercise multi-block accumulation, where each logical block's (block,half)
+//      identity is recovered at output time from the FIFO drain order (an output-domain
+//      phase counter), rather than from the feed-time tag which drifts one phase at the
+//      block boundary under WS preload/compute fusion. A distinct per-block scale makes a
+//      dropped or mis-scaled block fail the golden diff. See DOCS_MX/PLAN_MX.md (R3 / M5).
 //
 // Build prerequisite: compile against the DIM=16 MX params header
 // (`gemmini_params_mxint8_dim16.h`, MX_ENABLED=1, DIM=16); with the stock header
@@ -60,7 +58,7 @@ int main() {
 
 #define M DIM
 #define N DIM
-#define K_MAX 64
+#define K_MAX 128
 #define KB_MAX (K_MAX / MX_BLOCK_SIZE)
 
 static uint32_t lcg = 0x13572468u;
@@ -195,6 +193,28 @@ static int run_probe(void) {
   return check("probe", k, kb);
 }
 
+// Deterministic CROSS-BLOCK probe over kb logical blocks (k = kb * 32). All-ones
+// payloads; A uses a neutral exponent (eA=6) while each logical block b gets its own B
+// exponent eB=6+b, so block b contributes 32 << b and the accumulated result is
+// hw[i][j] = sum_{b=0..kb-1} 32 << b (96 for K=64, 224 for K=96, 480 for K=128). Because
+// every block carries a distinct, block-specific scale, a dropped block or one scaled by
+// the wrong block's exponent (the D4 tag-drift failure mode) shifts the sum detectably.
+static int run_probe_xblock(size_t k) {
+  clear_all();
+  const size_t kb = k / MX_BLOCK_SIZE;
+  for (size_t i = 0; i < M; i++) {
+    for (size_t kk = 0; kk < k; kk++) { a_payload[i][kk] = 1; }
+    for (size_t b = 0; b < kb; b++) { a_scale[i][b] = mxint8_e8m0_encode(6); }
+  }
+  for (size_t kk = 0; kk < k; kk++) {
+    for (size_t j = 0; j < N; j++) { b_payload[kk][j] = 1; }
+  }
+  for (size_t b = 0; b < kb; b++) {
+    for (size_t j = 0; j < N; j++) { b_scale[b][j] = mxint8_e8m0_encode(6 + (int)b); }
+  }
+  return check("xprobe", k, kb);
+}
+
 // Randomized fp32 packed through mxint8_pack.h, diffed against the golden. K is a
 // multiple of MX_BLOCK_SIZE so the two-phase split is exact (no K-tail here).
 static int run_random(size_t k) {
@@ -220,10 +240,15 @@ int main() {
   }
 #endif
 
+  // Coverage spans 1/2/3/4 logical blocks with a deterministic + randomized mix. (The
+  // set is kept to one run's worth of Verilator wall-clock; each K=96/128 GEMM is large.)
   int bad = 0;
-  bad |= run_probe();      // one logical block, two phases, deterministic two-phase sum
-  bad |= run_random(32);   // one logical block, two phases, randomized
-  bad |= run_random(32);   // second independent random draw (lcg advanced)
+  bad |= run_probe();           // 1 block, two phases, deterministic two-phase sum
+  bad |= run_random(32);        // 1 block, two phases, randomized
+  bad |= run_probe_xblock(64);  // 2 blocks, deterministic per-block scales (c = 96)
+  bad |= run_random(64);        // 2 blocks, randomized cross-block accumulate
+  bad |= run_random(96);        // 3 blocks, randomized
+  bad |= run_probe_xblock(128); // 4 blocks, deterministic per-block scales (c = 480)
 
   if (bad) {
     printf("mxint8_matmul_dim16: FAIL\n");
