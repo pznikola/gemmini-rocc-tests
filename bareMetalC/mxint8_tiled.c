@@ -11,8 +11,18 @@
 //
 // MX v1 supports a SINGLE output tile (I = J = 1, so M = N = DIM): the A-scale read address
 // is the output row (`output_counter`, 0..DIM-1) with no output-tile component. This test
-// covers a single output tile and a single MX K-block (one K tile); cross-block K through the
-// hardware loop unroller is a separate deferred limitation (see the note in main()).
+// covers a single output tile and a single MX K-block (one K tile) through the loop wrapper.
+//
+// KNOWN LIMITATION (deferred, see DOCS_MX/PLAN_MX.md S3 #5): cross-block K > one MX block
+// through the *hardware loop unroller* is wrong, but ONLY when the loop GEMM is preceded by
+// another loop GEMM. Root cause (deterministically reproduced and fully diagnosed): inter-GEMM
+// state leakage in the systolic mesh's internal output pipeline — a prior loop GEMM leaves
+// residual mesh state that freezes the next GEMM's first K-tile output after ~2 rows. It is
+// NOT an MX-datapath bug (scaling, two-phase, cross-block accumulate, and mvout are all
+// proven correct), and is orthogonal to the manual cross-block path, which is fully verified
+// (mxint8_matmul_dim32 K=64 and mxint8_matmul_dim16 K=64/96/128 all pass). The fix would
+// require resetting Mesh-internal pipeline state between GEMMs (the Mesh is DO-NOT-TOUCH);
+// the manual path is the supported route for multi-block MX GEMMs.
 //
 // Build prerequisite: compile against an MX params header (MX_ENABLED=1); with the stock
 // header this test is a no-op. WS, untransposed; single output tile M = N = DIM.
@@ -153,15 +163,11 @@ int main() {
 #endif
 
   int bad = 0;
-  bad |= run_random(MX_BLOCK_SIZE);      // single MX block (one K tile) through the loop wrapper
+  bad |= run_random(MX_BLOCK_SIZE);  // single MX block (one K tile) through the loop wrapper
 
-  // KNOWN LIMITATION (deferred): cross-block K > one MX block through the *hardware loop
-  // unroller* (e.g. run_random(2 * MX_BLOCK_SIZE)) currently produces wrong results — the
-  // LoopMatmul-driven preload/compute sequence does not advance the MX logical-K-block
-  // counter as the BlockScaleUnit expects, so the second block is mis-scaled/under-counted.
-  // This is orthogonal to the S3 #5 wrapper scale-count fix (the scales now load correctly;
-  // the single-block case above passes), and orthogonal to the manual cross-block path
-  // (mxint8_matmul_dim32 K=64 and mxint8_matmul_dim16 K=64/96/128 pass). Tracked separately.
+  // Cross-block K > one MX block through the loop wrapper is a known deferred limitation
+  // (inter-GEMM Mesh-internal state leakage; see the header note and DOCS_MX/PLAN_MX.md).
+  // Multi-block MX GEMMs use the manual path (mxint8_matmul_dim32 / mxint8_matmul_dim16).
 
   if (bad) {
     printf("mxint8_tiled: FAIL\n");
