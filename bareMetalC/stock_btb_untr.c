@@ -1,16 +1,22 @@
 // Apples-to-apples experiment: stock int8 (NO MXINT8), UNTRANSPOSED weight-stationary, via
 // the hardware loop unroller (`gemmini_loop_ws`) -- the exact mesh-feed configuration the MX
-// loop wrapper uses, minus the scale sidecar. Two back-to-back single-output-tile GEMMs
-// (M=N=DIM, K=2*DIM => 2 K-tiles), each compared to a full int32 CPU reference.
+// loop wrapper uses, minus the scale sidecar. SHAPE-MATCHED to the failing MX sequence
+// (mxint8_btb.c): GEMM1 = K=DIM (one K-tile), then GEMM2 = K=2*DIM (two K-tiles), both
+// single-output-tile (M=N=DIM), each checked against a full int32 CPU reference.
 //
-// The standard `tiled_matmul_auto` WS path feeds B through the transposer; MX requires
-// untransposed WS, which is the path that exhibited the inter-GEMM "mesh output freeze"
-// (DOCS_MX/PLAN_MX.md). If that freeze is the untransposed-loop path itself (a stock-Gemmini
-// corner), GEMM2 should be corrupted here even with no MX. If both pass, the failure is
-// specific to the MX wrapper/scaling, not the bare untransposed loop.
+// 2026-06-10: the first version of this control used K=2*DIM for BOTH GEMMs and PASSED,
+// which seemed to exonerate the stock path. But the MX failure is specifically a 1-K-tile
+// loop GEMM followed by a 2-K-tile loop GEMM, and the instrumented MX trace shows the
+// corruption is the raw mesh output of GEMM2's first K-tile freezing (scales/indices all
+// correct). This version reproduces the exact failing K sequence with MX fully out of the
+// picture: if GEMM2 fails here too, the freeze is a stock loop-unroller/mesh hand-off
+// effect that the MX tests merely expose; if it passes, the trigger is genuinely MX-side.
+// RESULT (2026-06-10): PASSES — which pinned the trigger as MX-side and led to the real root
+// cause: an RS RAW-hazard miss caused by the scale mvins polluting the RS's CONFIG_LOAD
+// decode (fixed in ReservationStation.scala; full story in DOCS_MX/BUG.md).
 //
-// Config below is copied verbatim from the known-working MX loop test (mxint8_tiled.c),
-// with the `config_mxint8` + scale mvins removed and `gemmini_loop_ws` called directly.
+// Config below is copied verbatim from mxint8_btb.c with `config_mxint8` + scale mvins
+// removed and `gemmini_loop_ws` called directly.
 
 #include <stdint.h>
 #include <stddef.h>
@@ -20,10 +26,10 @@
 
 #define M DIM
 #define N DIM
-#define K (2 * DIM)   // 2 K-tiles, single output tile (I = J = 1)
+#define K_MAX (2 * DIM)   // max 2 K-tiles, single output tile (I = J = 1)
 
-static elem_t a1[M][K] row_align(1), b1[K][N] row_align(1);
-static elem_t a2[M][K] row_align(1), b2[K][N] row_align(1);
+static elem_t a1[M][K_MAX] row_align(1), b1[K_MAX][N] row_align(1);
+static elem_t a2[M][K_MAX] row_align(1), b2[K_MAX][N] row_align(1);
 static acc_t  c1[M][N] row_align(1), c2[M][N] row_align(1);
 static acc_t  gold[M][N];
 
@@ -33,27 +39,27 @@ static void fill(elem_t *m, int rows, int cols) {
       m[i * cols + j] = (elem_t)((rand() % 3) - 1);
 }
 
-static void cpu(elem_t A[M][K], elem_t B[K][N]) {
+static void cpu(elem_t A[M][K_MAX], elem_t B[K_MAX][N], size_t k) {
   for (int i = 0; i < M; i++)
     for (int j = 0; j < N; j++) {
       acc_t s = 0;
-      for (int k = 0; k < K; k++) s += (acc_t)A[i][k] * (acc_t)B[k][j];
+      for (size_t kk = 0; kk < k; kk++) s += (acc_t)A[i][kk] * (acc_t)B[kk][j];
       gold[i][j] = s;
     }
 }
 
-static void run(elem_t A[M][K], elem_t B[K][N], acc_t C[M][N]) {
-  const size_t k_tiles = K / DIM;
+static void run(elem_t A[M][K_MAX], elem_t B[K_MAX][N], acc_t C[M][N], size_t k) {
+  const size_t k_tiles = k / DIM;
   gemmini_flush(0);
   gemmini_extended_config_ex(WEIGHT_STATIONARY, 0, 0, 1, false, false);
   gemmini_extended_config_st(N * sizeof(acc_t), 0, ACC_SCALE_IDENTITY);
-  gemmini_extended3_config_ld(K * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0); // A
-  gemmini_extended3_config_ld(N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1); // B
-  gemmini_extended3_config_ld(0, MVIN_SCALE_IDENTITY, false, 2);                  // D (none)
+  gemmini_extended3_config_ld(K_MAX * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0); // A
+  gemmini_extended3_config_ld(N * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1);     // B
+  gemmini_extended3_config_ld(0, MVIN_SCALE_IDENTITY, false, 2);                      // D (none)
 
   gemmini_loop_ws(1, 1, k_tiles, 0, 0, 0,
       &A[0][0], &B[0][0], NULL, &C[0][0],
-      K, N, 0, N,
+      K_MAX, N, 0, N,
       /*A_transpose=*/false, /*B_transpose=*/false,
       /*full_C=*/true, /*low_D=*/false, /*ex_accumulate=*/false,
       /*act=*/0, /*a_spad_id=*/0, /*b_spad_id=*/0, /*is_resadd=*/false);
@@ -73,11 +79,11 @@ static int check(const char *name, acc_t C[M][N]) {
 
 int main() {
   gemmini_flush(0);
-  fill((elem_t *)a1, M, K); fill((elem_t *)b1, K, N);
-  fill((elem_t *)a2, M, K); fill((elem_t *)b2, K, N);
+  fill((elem_t *)a1, M, K_MAX); fill((elem_t *)b1, K_MAX, N);
+  fill((elem_t *)a2, M, K_MAX); fill((elem_t *)b2, K_MAX, N);
 
-  run(a1, b1, c1); cpu(a1, b1); int m1 = check("GEMM1 untr-loop (isolated)", c1);
-  run(a2, b2, c2); cpu(a2, b2); int m2 = check("GEMM2 untr-loop (after GEMM1)", c2);
+  run(a1, b1, c1, DIM);     cpu(a1, b1, DIM);     int m1 = check("GEMM1 untr-loop K=DIM", c1);
+  run(a2, b2, c2, 2 * DIM); cpu(a2, b2, 2 * DIM); int m2 = check("GEMM2 untr-loop K=2*DIM", c2);
 
   int ok = (m1 == 0) && (m2 == 0);
   printf("stock_btb_untr: %s\n", ok ? "PASS" : "FAIL");

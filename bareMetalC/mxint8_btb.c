@@ -1,31 +1,24 @@
 // See LICENSE for license details.
 //
-// MXINT8 tiled-GEMM smoke test for the `gemmini_loop_ws_mxint8` wrapper (plan S3 #5).
+// MXINT8 back-to-back loop-GEMM regression for the 2026-06-10 ReservationStation RAW-hazard
+// fix (see DOCS_MX/BUG.md).
 //
-// Drives the MX block-scaled datapath through the hardware weight-stationary loop unroller
-// (`gemmini_loop_ws`) instead of the manual preload/compute path used by the other MX tests.
-// The wrapper composes `config_mxint8` + the A/B scale mvins + `gemmini_loop_ws`. This test
-// validates the S3 #5 fix: the scale mvins must receive ELEMENT counts, not the tile counts
-// `gemmini_loop_ws` consumes — both the A/B output extents (M = I*DIM - pad_I, N = J*DIM -
-// pad_J) and the K-block count (k_blocks over K*DIM - pad_K elements, since K is a tile count).
+// Drives two consecutive GEMMs through the `gemmini_loop_ws_mxint8` wrapper (the hardware WS
+// loop unroller): GEMM1 with K = one MX block, then GEMM2 with K = two MX blocks. This exact
+// sequence used to corrupt GEMM2's first K-tile: the MX scale mvins (marked `is_config` in the
+// reservation station) were wrongly decoded by the RS's CONFIG_LOAD alloc hook, so their DRAM
+// pointer bits clobbered the RS's `ld_pixel_repeats`/`ld_block_strides` mirror; the A-payload
+// mvin's dependency range was then mis-decoded, the compute's RAW overlap check missed the
+// in-flight A mvin, and the compute issued while the A tile was still being DMA-written — the
+// mesh was fed stale scratchpad rows (the historical "frozen first K-tile" symptom). The race
+// only bit GEMMs whose A mvin was slow (TLB flush + traffic), which made it look "inter-GEMM".
 //
-// MX v1 supports a SINGLE output tile (I = J = 1, so M = N = DIM): the A-scale read address
-// is the output row (`output_counter`, 0..DIM-1) with no output-tile component. This test
-// covers a single output tile and a single MX K-block (one K tile) through the loop wrapper.
+// With -DMXINT8_BTB_PROBE=1 (separate binary), GEMM2 uses a deterministic probe whose wrong
+// values decode to the exact scale/data the hardware consumed (diagnosis aid).
 //
-// KNOWN LIMITATION (deferred, see DOCS_MX/PLAN_MX.md S3 #5): cross-block K > one MX block
-// through the *hardware loop unroller* is wrong, but ONLY when the loop GEMM is preceded by
-// another loop GEMM. Root cause (deterministically reproduced and fully diagnosed): inter-GEMM
-// state leakage in the systolic mesh's internal output pipeline — a prior loop GEMM leaves
-// residual mesh state that freezes the next GEMM's first K-tile output after ~2 rows. It is
-// NOT an MX-datapath bug (scaling, two-phase, cross-block accumulate, and mvout are all
-// proven correct), and is orthogonal to the manual cross-block path, which is fully verified
-// (mxint8_matmul_dim32 K=64 and mxint8_matmul_dim16 K=64/96/128 all pass). The fix would
-// require resetting Mesh-internal pipeline state between GEMMs (the Mesh is DO-NOT-TOUCH);
-// the manual path is the supported route for multi-block MX GEMMs.
-//
-// Build prerequisite: compile against an MX params header (MX_ENABLED=1); with the stock
-// header this test is a no-op. WS, untransposed; single output tile M = N = DIM.
+// MX v1 supports a SINGLE output tile (I = J = 1, so M = N = DIM). Build prerequisite: compile
+// against an MX params header (MX_ENABLED=1); with the stock header this test is a no-op.
+// WS, untransposed.
 
 #include <stdint.h>
 #include <stddef.h>
@@ -154,6 +147,46 @@ static int run_random(size_t k) {
   return check("tiled", k);
 }
 
+#ifdef MXINT8_BTB_PROBE
+// Deterministic cross-block probe (diagnosis aid, BUG.md §4.1 style): payloads give exact
+// power-of-two raw partials (block0 raw = 32/cell, block1 raw = 64/cell) and every
+// (row, block) A exponent and (block, col) B exponent is distinct, so a wrong hw value
+// decodes directly to WHICH scale entry the hardware actually consumed:
+//   c[i][j] = 32 * 2^(eA[i][0]+eB[0][j]-12) + 64 * 2^(eA[i][1]+eB[1][j]-12)
+// All shifts land in [-3, +4]; every contribution is exact (no rounding ambiguity).
+static int run_probe(size_t k) {
+  clear_all();
+  for (size_t i = 0; i < M; i++) {
+    for (size_t kk = 0; kk < k; kk++) { a_payload[i][kk] = kk < MX_BLOCK_SIZE ? 1 : 2; }
+    a_scale[i][0] = mxint8_e8m0_encode(6 + (int)(i % 4));
+    a_scale[i][1] = mxint8_e8m0_encode(4 + (int)(i % 3));
+  }
+  for (size_t kk = 0; kk < k; kk++) {
+    for (size_t j = 0; j < N; j++) { b_payload[kk][j] = 1; }
+  }
+  for (size_t j = 0; j < N; j++) {
+    b_scale[0][j] = mxint8_e8m0_encode(6 + (int)(j % 2));
+    b_scale[1][j] = mxint8_e8m0_encode(5 + (int)(j % 3));
+  }
+
+  const int rc = check("probe", k);
+  if (rc) {
+    // Compact decode dump: per row, first mismatching column with hw vs gold.
+    for (size_t i = 0; i < M; i++) {
+      int row_mism = 0, fj = -1;
+      for (size_t j = 0; j < N; j++) {
+        if (c_hw[i][j] != gold[i][j]) { if (fj < 0) fj = (int)j; row_mism++; }
+      }
+      if (row_mism)
+        printf("  row %2d: %2d mism, first j=%2d hw=%d gold=%d (eA0=%d eA1=%d)\n",
+               (int)i, row_mism, fj, (int)c_hw[i][fj], (int)gold[i][fj],
+               6 + (int)(i % 4), 4 + (int)(i % 3));
+    }
+  }
+  return rc;
+}
+#endif // MXINT8_BTB_PROBE
+
 int main() {
 #ifndef BAREMETAL
   if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
@@ -164,8 +197,15 @@ int main() {
 
   // Reproduce the documented MX-loop inter-GEMM failure on the CURRENT RTL: a loop K=64 GEMM
   // preceded by another loop GEMM. GEMM1 = K=32 (one block), GEMM2 = K=64 (two blocks).
+  // With -DMXINT8_BTB_PROBE=1, GEMM2 uses the deterministic probe instead, whose wrong values
+  // decode to the exact scale entry the hardware consumed (separate binary so the random
+  // repro's instruction stream stays byte-identical -- the bug is timing-sensitive).
   int g1 = run_random(MX_BLOCK_SIZE);       // GEMM1: K=32
+#ifdef MXINT8_BTB_PROBE
+  int g2 = run_probe(2 * MX_BLOCK_SIZE);    // GEMM2: deterministic K=64, preceded by GEMM1
+#else
   int g2 = run_random(2 * MX_BLOCK_SIZE);   // GEMM2: K=64, preceded by GEMM1
+#endif
 
   if (g1 || g2) {
     printf("mxint8_btb: FAIL (g1=%d g2=%d)\n", g1, g2);

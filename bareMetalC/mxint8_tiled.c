@@ -11,18 +11,19 @@
 //
 // MX v1 supports a SINGLE output tile (I = J = 1, so M = N = DIM): the A-scale read address
 // is the output row (`output_counter`, 0..DIM-1) with no output-tile component. This test
-// covers a single output tile and a single MX K-block (one K tile) through the loop wrapper.
+// covers a single output tile with K = one and two MX K-blocks through the loop wrapper,
+// run back-to-back (the second GEMM following the first in the same program).
 //
-// KNOWN LIMITATION (deferred, see DOCS_MX/PLAN_MX.md S3 #5): cross-block K > one MX block
-// through the *hardware loop unroller* is wrong, but ONLY when the loop GEMM is preceded by
-// another loop GEMM. Root cause (deterministically reproduced and fully diagnosed): inter-GEMM
-// state leakage in the systolic mesh's internal output pipeline — a prior loop GEMM leaves
-// residual mesh state that freezes the next GEMM's first K-tile output after ~2 rows. It is
-// NOT an MX-datapath bug (scaling, two-phase, cross-block accumulate, and mvout are all
-// proven correct), and is orthogonal to the manual cross-block path, which is fully verified
-// (mxint8_matmul_dim32 K=64 and mxint8_matmul_dim16 K=64/96/128 all pass). The fix would
-// require resetting Mesh-internal pipeline state between GEMMs (the Mesh is DO-NOT-TOUCH);
-// the manual path is the supported route for multi-block MX GEMMs.
+// HISTORY (fixed 2026-06-10, see DOCS_MX/BUG.md): cross-block K through the loop wrapper used
+// to fail when the loop GEMM was preceded by another loop GEMM. The real root cause was a
+// ReservationStation RAW-hazard miss: the MX scale mvins (marked `is_config`) were wrongly
+// decoded by the RS's CONFIG_LOAD alloc hook, so their DRAM pointer bits clobbered the RS's
+// `ld_pixel_repeats`/`ld_block_strides` mirror; the following A-payload mvin's dependency
+// range was then mis-decoded, the compute issued while the A tile was still being DMA-written,
+// and the mesh was fed stale scratchpad rows (the historical "frozen first K-tile" symptom).
+// Fixed by excluding `is_mx_scale` entries from that hook (ReservationStation.scala); the
+// mesh, MX datapath, and loop unroller were all correct. The back-to-back K=32 -> K=64 case
+// below is the regression for that fix (also covered by bareMetalC/mxint8_btb.c).
 //
 // Build prerequisite: compile against an MX params header (MX_ENABLED=1); with the stock
 // header this test is a no-op. WS, untransposed; single output tile M = N = DIM.
@@ -163,11 +164,10 @@ int main() {
 #endif
 
   int bad = 0;
-  bad |= run_random(MX_BLOCK_SIZE);  // single MX block (one K tile) through the loop wrapper
-
-  // Cross-block K > one MX block through the loop wrapper is a known deferred limitation
-  // (inter-GEMM Mesh-internal state leakage; see the header note and DOCS_MX/PLAN_MX.md).
-  // Multi-block MX GEMMs use the manual path (mxint8_matmul_dim32 / mxint8_matmul_dim16).
+  bad |= run_random(MX_BLOCK_SIZE);      // single MX block (one K tile) through the loop wrapper
+  // Cross-block K back-to-back after another loop GEMM: regression for the 2026-06-10
+  // ReservationStation RAW-hazard fix (see the header note and DOCS_MX/BUG.md).
+  bad |= run_random(2 * MX_BLOCK_SIZE);  // two MX blocks (two K tiles), preceded by the GEMM above
 
   if (bad) {
     printf("mxint8_tiled: FAIL\n");

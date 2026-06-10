@@ -20,6 +20,7 @@ tests = \
 	mxint8_matmul_partial \
 	mxint8_matmul_dim16 \
 	mxint8_tiled \
+	mxint8_btb \
 	matmul_spad \
 	raw_hazard \
 	aligned \
