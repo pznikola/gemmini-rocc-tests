@@ -9,11 +9,17 @@
 //
 // Cases: all-zero payloads; max +127 and -127 payloads with shifts that saturate
 // the int32 accumulator (int32-range and 64-bit-overflow regimes — exercises the
-// R2-2 scalePowerOfTwo/saturate path); alternating signs with small scales
-// (negative shift ⇒ nearest-even right-shift rounding); random valid exponents
-// (mixed positive/negative shifts); K-tail (K=40, second block only 8 valid K
-// lanes, the rest zero-padded — exercises tail masking); and a golden-only
-// 0xff-reject check (loading 0xff into hardware would fire the MXScaleSRAM assert).
+// R2-2 scalePowerOfTwo/saturate path); -128 payloads (OCP spec 5.3.4 leaves -128
+// unused for *encoders* — our packer never emits it — but conformant third-party
+// data may contain it; checked exact, int32-saturating, and negative-shift-rounding
+// at 31 saturating lanes so the raw partial stays within the mesh's 20-bit
+// `spatialArrayOutputType` envelope, plus a +127/-128 mix — see the case_neg128
+// comment for why a full 32-lane -128 block is one LSB out of envelope); alternating
+// signs with small scales (negative shift ⇒ nearest-even right-shift rounding);
+// random valid exponents (mixed positive/negative shifts); K-tail (K=40, second
+// block only 8 valid K lanes, the rest zero-padded — exercises tail masking); and a
+// golden-only 0xff-reject check (loading 0xff into hardware would fire the
+// MXScaleSRAM assert).
 //
 // Build prerequisite: compile against gemmini_params_mxint8_dim32.h (MX_ENABLED=1).
 // Scope: single output tile (M = N = DIM); partial M/N tiles are a later case.
@@ -167,6 +173,45 @@ static int case_altsign_round(void) {
   return check("altsign", MX_BLOCK_SIZE, 1);
 }
 
+// `lanes` (<= MX_BLOCK_SIZE-1) lanes of -128 in both A and B, the rest zero, under
+// uniform scale ex. raw = lanes * (-128)^2 = lanes * 16384, kept within the mesh's
+// 20-bit `spatialArrayOutputType` envelope [-2^19, 2^19-1] = [-524288, 524287]. A
+// *full* 32-lane -128 block reaches 32*128^2 = 2^19 = 524288, one LSB past the +524287
+// max, so it exceeds the RES-OPT-narrowed raw width and is outside the supported
+// envelope; the conformant packer never emits -128 (OCP 5.3.4 "may"; OCP_CONFORMANCE.md
+// row 7). 31 lanes give 507904, a near-max representable -128 block.
+static int case_neg128(const char *label, size_t lanes, int ex) {
+  clear_inputs();
+  for (size_t i = 0; i < M; i++) {
+    for (size_t kk = 0; kk < lanes; kk++) { a_payload[i][kk] = -128; }
+    a_scale[i][0] = mxint8_e8m0_encode(ex);
+  }
+  for (size_t kk = 0; kk < lanes; kk++) {
+    for (size_t j = 0; j < N; j++) { b_payload[kk][j] = -128; }
+  }
+  for (size_t j = 0; j < N; j++) { b_scale[0][j] = mxint8_e8m0_encode(ex); }
+  return check(label, MX_BLOCK_SIZE, 1);
+}
+
+static int case_neg128_mixed(void) {
+  clear_inputs();
+  // -128 interleaved with +127 under random valid exponents: the raw partial mixes
+  // the spec's unused-by-encoders -2.0 encoding with max normal across both sign
+  // regimes. The structured alternation keeps raw in [-520192, 520208], inside the
+  // 20-bit mesh envelope.
+  for (size_t i = 0; i < M; i++) {
+    for (size_t kk = 0; kk < MX_BLOCK_SIZE; kk++) {
+      a_payload[i][kk] = ((i + kk) & 1) ? -128 : 127;
+    }
+    a_scale[i][0] = mxint8_e8m0_encode(rnd(-10, 10));
+  }
+  for (size_t kk = 0; kk < MX_BLOCK_SIZE; kk++) {
+    for (size_t j = 0; j < N; j++) { b_payload[kk][j] = ((kk + j) & 1) ? -128 : 127; }
+  }
+  for (size_t j = 0; j < N; j++) { b_scale[0][j] = mxint8_e8m0_encode(rnd(-10, 10)); }
+  return check("neg128mix", MX_BLOCK_SIZE, 1);
+}
+
 static int case_random_exp(void) {
   clear_inputs();
   // Random int8 payloads + random valid E8M0 exponents in [-18,18] ⇒ a spread of
@@ -230,6 +275,13 @@ int main() {
   bad |= case_saturate("max_pos32", 127, 127, 13);  // shift 14, +raw ⇒ INT32_MAX
   bad |= case_saturate("max_neg32", 127, -127, 13); // shift 14, -raw ⇒ INT32_MIN
   bad |= case_saturate("max_pos64", 127, 127, 31);  // shift 50: 64-bit-overflow path ⇒ INT32_MAX
+  // -128 payloads (consumer side of the spec-5.3.4 "may leave -2 unused" rule), kept
+  // within the 20-bit mesh raw envelope via 31 saturating lanes (raw = 31*16384 =
+  // 507904). The conformant packer never emits -128.
+  bad |= case_neg128("neg128_exact", 31, 6);   // shift 0:  C = 507904 exactly
+  bad |= case_neg128("neg128_sat",   31, 13);  // shift 14: 507904<<14 > INT32_MAX ⇒ INT32_MAX
+  bad |= case_neg128("neg128_round", 31, -2);  // shift -16: 507904>>16 RNE = 8
+  bad |= case_neg128_mixed();
   bad |= case_altsign_round();
   bad |= case_random_exp();
   bad |= case_ktail();

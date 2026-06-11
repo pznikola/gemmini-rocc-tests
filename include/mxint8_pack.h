@@ -4,11 +4,16 @@
 // representation consumed by both the software golden (`mxint8_golden.h`) and
 // the Gemmini hardware scale-mvin path (`gemmini_mvin_mxscale_a/b`).
 //
-// For a 32-element MX block the packer picks the smallest E8M0 power-of-two
-// shared scale `2^(e-6)` that keeps every signed-int8 payload in the symmetric
-// range `[-127, 127]`, then rounds each element to nearest-even. A row of A is
-// quantized per K block (`A_scale[M][ceil(K/32)]`); a column of B is quantized
-// per K block (`B_scale[ceil(K/32)][N]`), matching `mxint8_policy.md`.
+// For a 32-element MX block the packer implements the OCP MX v1.0 spec 6.3
+// recommended conversion: the shared scale is the largest power of two not
+// exceeding the block amax (`X = 2^e`, `e = floor(log2(amax))`; the largest
+// power of two representable in the INT8 element type is 1.0, so there is no
+// further offset), each element is `V/X` rounded to nearest-even in the
+// implicit-2^-6 payload grid, and payloads beyond max normal are clamped to
+// +/-127 preserving sign. The maximum negative encoding -128 is left unused
+// (spec 5.3.4 "may"). A row of A is quantized per K block
+// (`A_scale[M][ceil(K/32)]`); a column of B is quantized per K block
+// (`B_scale[ceil(K/32)][N]`), matching `mxint8_policy.md`.
 
 #ifndef GEMMINI_MXINT8_PACK_H
 #define GEMMINI_MXINT8_PACK_H
@@ -43,21 +48,23 @@ static inline float mxint8_exp2f_int(int m) {
 }
 
 /**
- * Smallest integer `p` such that `2^p >= x`, for `x > 0` (no libm).
+ * Largest integer `p` such that `2^p <= x`, for `x > 0` (no libm).
  *
- * @param x A strictly positive, normalized float.
- * @return `ceil(log2(x))`.
+ * Subnormal inputs report `-127`, the bottom of the E8M0 exponent range, which
+ * is also where `mxint8_e8m0_encode` would clamp the true (smaller) exponent.
+ *
+ * @param x A strictly positive float.
+ * @return `floor(log2(x))`.
  */
-static inline int mxint8_ceil_log2f(float x) {
+static inline int mxint8_floor_log2f(float x) {
   union {
     float f;
     uint32_t u;
   } v;
   v.f = x;
 
-  const int floor_exp = (int)((v.u >> 23) & 0xffu) - 127; // floor(log2(x))
-  const uint32_t mantissa = v.u & 0x7fffffu;
-  return (mantissa == 0u) ? floor_exp : floor_exp + 1; // exact power of two?
+  const int biased = (int)((v.u >> 23) & 0xffu);
+  return (biased == 0) ? -127 : biased - 127;
 }
 
 /**
@@ -97,13 +104,28 @@ static inline mx_scale_t mxint8_quantize_block(const float *vals, size_t n,
     }
   }
 
-  // Smallest exponent `e` with payload step `2^(e-6) >= amax/127`, so the block
-  // maximum maps to <= 127. An all-zero block takes the neutral scale `e = 0`.
-  const int exp = (amax == 0.0f) ? 0 : mxint8_ceil_log2f(amax / 127.0f) + MX_INT_FRAC_BITS;
-  const float inv_step = mxint8_exp2f_int(MX_INT_FRAC_BITS - exp); // 2^(6-e)
+  // OCP MX v1.0 spec 6.3: the scale is the largest power of two <= amax, i.e.
+  // `e = floor(log2(amax))`, and elements quantize as `V/X` on the implicit-2^-6
+  // grid with clamp-to-max-normal (+/-127). An all-zero block takes the neutral
+  // scale `e = 0` (the spec leaves this case undefined; see mxint8_policy.md).
+  // `V/X` reaches [1, 2) for the block maximum, so the x64 grid value lands in
+  // [64, 128) and the clamp catches the round-up to 128.
+  int exp = (amax == 0.0f) ? 0 : mxint8_floor_log2f(amax);
+  // Clamp to the sub-range where `2^-e` is a representable *normal* float so the
+  // payload scaling never underflows to zero. `mxint8_floor_log2f` already floors
+  // subnormal amax at -127 (the E8M0 minimum); the upper clamp only bites for
+  // amax >= 2^127, far outside the MXINT8 domain (values are expected within normal
+  // fp32 range), where the block then saturates its payloads against a 2^126 scale.
+  if (exp > 126) {
+    exp = 126;
+  }
+  // Two exact power-of-two multiplies: `2^(6-e)` itself can overflow fp32 for
+  // e < -121, so scale by `2^-e` (now representable) and the `2^6` grid separately.
+  const float inv_x = mxint8_exp2f_int(-exp); // 2^-e
+  const float grid = mxint8_exp2f_int(MX_INT_FRAC_BITS); // 2^6
 
   for (size_t t = 0; t < n; t++) {
-    int32_t q = (int32_t)ROUND_NEAR_EVEN(vals[t] * inv_step);
+    int32_t q = (int32_t)ROUND_NEAR_EVEN(vals[t] * inv_x * grid);
     if (q > 127) {
       q = 127;
     }
