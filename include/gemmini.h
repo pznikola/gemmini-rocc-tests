@@ -213,13 +213,37 @@ static acc_scale_t_bits acc_scale_t_to_acc_scale_t_bits(acc_scale_t x) {
 #define ROCC_INSTRUCTION_RS1_RS2(x, rs1, rs2, funct) \
   ROCC_INSTRUCTION_0_R_R(x, rs1, rs2, funct)
 
-_STATIC void gemmini_config_mxint8(bool enable, uint32_t flags) {
+/**
+ * Configures the MX unit with the tiled-loop geometry (policy Appendix A).
+ *
+ * rs2 packs {log2_Jp[39:32], J_tiles[31:16], I_tiles[15:0]}; zero tile counts decay to 1
+ * in hardware, so the plain single-tile wrapper below stays valid.
+ *
+ * @param enable Enables (true) or disables (false) the MX execute path.
+ * @param flags Reserved MX config flags (bits 8+ of rs1).
+ * @param i_tiles Output tile count along M for the next hardware loop.
+ * @param j_tiles Output tile count along N for the next hardware loop.
+ * @param log2_jp Log2 of the padded power-of-two C-tile pitch (Jp >= j_tiles).
+ */
+_STATIC void gemmini_config_mxint8_tiled(bool enable, uint32_t flags,
+                                         size_t i_tiles, size_t j_tiles,
+                                         size_t log2_jp) {
 #if MX_ENABLED
-  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)flags << 8) | MX_CONFIG_RESET_K | (uint64_t)(enable != 0), 0, k_CONFIG_MXINT8);
+  ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC,
+      ((uint64_t)flags << 8) | MX_CONFIG_RESET_K | (uint64_t)(enable != 0),
+      ((uint64_t)log2_jp << 32) | ((uint64_t)j_tiles << 16) | (uint64_t)i_tiles,
+      k_CONFIG_MXINT8);
 #else
   (void)enable;
   (void)flags;
+  (void)i_tiles;
+  (void)j_tiles;
+  (void)log2_jp;
 #endif
+}
+
+_STATIC void gemmini_config_mxint8(bool enable, uint32_t flags) {
+  gemmini_config_mxint8_tiled(enable, flags, 1, 1, 0);
 }
 
 _STATIC void gemmini_mvin_mxscale_a(const mx_scale_t *scale_ptr,
@@ -428,12 +452,58 @@ static int ceil_divide_int(int a, int b){
     ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)(a_spad_id) << 18) | ((uint64_t)(b_spad_id) << 16) | ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (ex_accumulate), ((is_resadd) << 2) | ((B_transpose) << 1) | (A_transpose), k_LOOP_WS) \
   }
 
+// MX variant of `gemmini_loop_ws` (policy Appendix A): identical command sequence, plus
+// LOOP_WS rs1 bit 3 (MX loop marker) and rs1 bits 7:4 (log2 of the padded power-of-two
+// C-tile pitch Jp). Stock software leaves those rs1 bits zero.
+#define gemmini_loop_ws_mx(I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_stride, B_stride, D_stride, C_stride, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act, a_spad_id, b_spad_id, is_resadd, mx_log2_jp) \
+  { \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, A, B, k_LOOP_WS_CONFIG_ADDRS_AB) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, D, C, k_LOOP_WS_CONFIG_ADDRS_DC) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, A_stride, B_stride, k_LOOP_WS_CONFIG_STRIDES_AB) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, D_stride, C_stride, k_LOOP_WS_CONFIG_STRIDES_DC) \
+    ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)(a_spad_id) << 18) | ((uint64_t)(b_spad_id) << 16) | ((uint64_t)(act) << 8) | ((uint64_t)(mx_log2_jp) << 4) | (1ULL << 3) | ((low_D) << 2) | ((full_C) << 1) | (ex_accumulate), ((is_resadd) << 2) | ((B_transpose) << 1) | (A_transpose), k_LOOP_WS) \
+  }
+
 #define gemmini_loop_ws_spad(I, J, K, pad_I, pad_J, pad_K, A, B, D, C, A_transpose, B_transpose, full_C, low_D, ex_accumulate, act, a_spad_id, b_spad_id, is_resadd, skips) \
   { \
     ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)(pad_K) << 32) | ((uint64_t)(pad_J) << 16) | (uint64_t)(pad_I), ((uint64_t)(K) << 32) | ((uint64_t)(J) << 16) | (uint64_t)(I), k_LOOP_WS_CONFIG_BOUNDS) \
     ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, A, B, k_LOOP_WS_CONFIG_SPAD_AB) \
     ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, ((uint64_t)(a_spad_id) << 18) | ((uint64_t)(b_spad_id) << 16) | ((uint64_t)(act) << 8) | ((low_D) << 2) | ((full_C) << 1) | (ex_accumulate), ((uint64_t)(C) << 32) | 0x200U | (skips) | ((is_resadd) << 2) | ((B_transpose) << 1) | (A_transpose), k_LOOP_WS) \
   }
+
+/**
+ * Repacks dense B scales into the padded tiled image of the MX scale SRAM B region
+ * (`mxint8_policy.md` Appendix A.2): one output row per `(kb, tile_j)` pair at row
+ * `kb*jp + tile_j`, holding that tile's `DIM` column-scale bytes (lane = column within
+ * the tile). Lanes beyond `n` and whole padding tile slots (`tile_j >= ceil(n/DIM)`)
+ * hold the neutral E8M0 byte (127, exponent 0) so every stored lane decodes as valid.
+ *
+ * @param b_scale Dense B scales (`B_scale[kb][n]`), row stride `b_scale_stride`.
+ * @param k_blocks Number of logical 32-element K blocks.
+ * @param n Number of B columns covered (`<= jp*DIM`).
+ * @param b_scale_stride Element stride between dense B-scale rows.
+ * @param jp Padded power-of-two output-tile pitch (`Jp >= ceil(n/DIM)`).
+ * @param out Output image, `(k_blocks*jp) x DIM` bytes, row-major.
+ */
+_STATIC void mxint8_repack_b_scales_tiled(const mx_scale_t *b_scale,
+                                          size_t k_blocks, size_t n,
+                                          size_t b_scale_stride, size_t jp,
+                                          mx_scale_t *out) {
+  const size_t j_tiles = (n + DIM - 1) / DIM;
+  const mx_scale_t neutral = (mx_scale_t)127;  // E8M0 encode(0): 2^0
+
+  for (size_t kb = 0; kb < k_blocks; kb++) {
+    for (size_t tj = 0; tj < jp; tj++) {
+      mx_scale_t *row = &out[(kb * jp + tj) * DIM];
+      for (size_t lane = 0; lane < DIM; lane++) {
+        const size_t col = tj * DIM + lane;
+        row[lane] = (tj < j_tiles && col < n) ? b_scale[kb * b_scale_stride + col]
+                                              : neutral;
+      }
+    }
+  }
+}
 
 _STATIC void gemmini_loop_ws_mxint8(size_t I, size_t J, size_t K,
                                     size_t pad_I, size_t pad_J, size_t pad_K,
@@ -458,23 +528,16 @@ _STATIC void gemmini_loop_ws_mxint8(size_t I, size_t J, size_t K,
                                     int a_spad_id,
                                     int b_spad_id,
                                     bool is_resadd) {
+  // Scratch image for the repacked B scales (Appendix A.2 layout), sized for the whole
+  // SRAM B region. One per translation unit (baremetal tests are single-TU).
+  static mx_scale_t mxint8_b_scale_tiled[(MX_SCALE_SP_ROWS / 2) * DIM];
+
   // K is a count of DIM-wide tiles (exactly as `gemmini_loop_ws` consumes it), so the K
   // *element* extent is K*DIM - pad_K; the MX block count is over those elements. (Using K
   // directly here would treat tiles as elements and under-count the K blocks — e.g. 2 tiles
   // at DIM=32 = 64 K-elements = 2 MX blocks, not ceil(2/32)=1.)
   const size_t k_elems = K * DIM - pad_K;
   const size_t k_blocks = (k_elems + MX_BLOCK_SIZE - 1) / MX_BLOCK_SIZE;
-
-  // MX v1 supports a single output tile only (I == J == 1, so M, N <= DIM). The A-scale
-  // read address is the output row (`output_counter`, 0..DIM-1) with no output-tile
-  // component, so issuing multiple output tiles would reuse one tile's scales. Multi-tile
-  // support needs an RTL scale-read-address tiling path (a later phase). Fail loudly rather
-  // than silently corrupt.
-  if (I != 1 || J != 1) {
-    printf("gemmini_loop_ws_mxint8: only a single output tile (I=J=1, M,N<=DIM) is supported "
-           "in MX v1; got I=%lu J=%lu\n", (unsigned long)I, (unsigned long)J);
-    exit(1);
-  }
 
   // The scale mvins take ELEMENT counts, not tile counts: A-scale `rows` is the number of
   // M output rows (= I*DIM - pad_I) and B-scale `cols` is the number of N output columns
@@ -483,16 +546,199 @@ _STATIC void gemmini_loop_ws_mxint8(size_t I, size_t J, size_t K,
   const size_t m_rows = I * DIM - pad_I;
   const size_t n_cols = J * DIM - pad_J;
 
-  gemmini_config_mxint8(true, 0);
-  gemmini_mvin_mxscale_a(A_scale, 0, m_rows, k_blocks, A_scale_stride);
-  gemmini_mvin_mxscale_b(B_scale, MX_SCALE_SP_ROWS / 2, k_blocks, n_cols, B_scale_stride);
+  // Padded power-of-two C-tile pitch (policy Appendix A.1).
+  size_t log2_jp = 0;
+  while (((size_t)1 << log2_jp) < J) {
+    log2_jp++;
+  }
+  const size_t jp = (size_t)1 << log2_jp;
 
-  gemmini_loop_ws(I, J, K, pad_I, pad_J, pad_K,
-                  A_payload, B_payload, D, C,
-                  A_stride, B_stride, D_stride, C_stride,
-                  A_transpose, B_transpose,
-                  full_C, low_D, ex_accumulate, act,
-                  a_spad_id, b_spad_id, is_resadd);
+  // At DIM < MX_BLOCK_SIZE the K extent must cover whole logical blocks in K *tiles*
+  // (K % (MX_BLOCK_SIZE/DIM) == 0): a half-block tail would never reach its final
+  // physical phase, so its contribution would be silently dropped. pad_K still covers
+  // sub-tile element padding within the last block.
+  if (DIM < MX_BLOCK_SIZE && K % (MX_BLOCK_SIZE / DIM) != 0) {
+    printf("gemmini_loop_ws_mxint8: K=%lu tiles is not a whole number of MX blocks "
+           "(%d tiles per block); pad K up to a block boundary\n",
+           (unsigned long)K, MX_BLOCK_SIZE / DIM);
+    exit(1);
+  }
+
+  // Invocation envelope (policy Appendix A.5). Fail loudly rather than silently corrupt.
+  if (k_blocks > DIM) {
+    printf("gemmini_loop_ws_mxint8: k_blocks=%lu exceeds the A-scale lane width DIM=%d\n",
+           (unsigned long)k_blocks, DIM);
+    exit(1);
+  }
+  if (I * DIM > MX_SCALE_SP_ROWS / 2) {
+    printf("gemmini_loop_ws_mxint8: I=%lu output-tile rows exceed the A-scale region\n",
+           (unsigned long)I);
+    exit(1);
+  }
+  if (k_blocks * jp > MX_SCALE_SP_ROWS / 2) {
+    printf("gemmini_loop_ws_mxint8: k_blocks*Jp=%lu rows exceed the B-scale region\n",
+           (unsigned long)(k_blocks * jp));
+    exit(1);
+  }
+  if (I * jp * DIM > ACC_ROWS / 2) {
+    printf("gemmini_loop_ws_mxint8: I*Jp=%lu padded output tiles exceed the accumulator "
+           "half\n", (unsigned long)(I * jp));
+    exit(1);
+  }
+
+  // CONFIG_MXINT8 executes at the controller front-end (not RS-ordered) and its RESET_K
+  // pulse re-zeroes the drain-order walk, so all prior MX work must have drained before
+  // reconfiguring. The fence also protects the shared repack image below, which a
+  // previous invocation's scale DMA may still be reading. (Per-invocation drain is a
+  // known throughput cost on chunked problems; an RS-ordered MX config is future work.)
+  gemmini_fence();
+
+  gemmini_config_mxint8_tiled(true, 0, I, J, log2_jp);
+  gemmini_mvin_mxscale_a(A_scale, 0, m_rows, k_blocks, A_scale_stride);
+
+  // B scales: load the padded tiled image (one SRAM row per (kb, tile_j) pair). When the
+  // dense host layout already is that image (full tiles, dense stride, power-of-two J),
+  // load it directly; otherwise repack on the host first.
+  if (n_cols == jp * DIM && B_scale_stride == n_cols) {
+    gemmini_mvin_mxscale_b(B_scale, MX_SCALE_SP_ROWS / 2, k_blocks * jp, DIM, DIM);
+  } else {
+    mxint8_repack_b_scales_tiled(B_scale, k_blocks, n_cols, B_scale_stride, jp,
+                                 mxint8_b_scale_tiled);
+    gemmini_mvin_mxscale_b(mxint8_b_scale_tiled, MX_SCALE_SP_ROWS / 2, k_blocks * jp,
+                           DIM, DIM);
+  }
+
+  gemmini_loop_ws_mx(I, J, K, pad_I, pad_J, pad_K,
+                     A_payload, B_payload, D, C,
+                     A_stride, B_stride, D_stride, C_stride,
+                     A_transpose, B_transpose,
+                     full_C, low_D, ex_accumulate, act,
+                     a_spad_id, b_spad_id, is_resadd, log2_jp);
+}
+
+/**
+ * Software outer tiler for MXINT8 GEMM: C = A*B (+ D), with M/N/K in elements.
+ *
+ * Splits the problem into hardware-loop invocations that satisfy the policy Appendix A.5
+ * envelope (scale-SRAM regions, accumulator half, scratchpad half) and chains K chunks
+ * with the stock pattern: D only on the first K chunk, C written out only on the last,
+ * `ex_accumulate` in between (the accumulator base only advances when C is non-NULL, so
+ * all K chunks of one (i0, j0) group accumulate into the same rows). K chunk boundaries
+ * are aligned to MX_BLOCK_SIZE so no logical block straddles two invocations (a straddled
+ * block would be scaled per-chunk and break bit-exactness).
+ *
+ * @param M Output rows (elements).
+ * @param N Output columns (elements).
+ * @param K Reduction extent (elements).
+ * @param A_payload MXINT8 A payloads, row stride `A_stride`.
+ * @param B_payload MXINT8 B payloads, row stride `B_stride`.
+ * @param D Bias matrix or NULL, row stride `D_stride` (acc_t unless `low_D`).
+ * @param C Output matrix, row stride `C_stride` (acc_t if `full_C`, else elem_t).
+ * @param A_scale A scales (`A_scale[M][ceil(K/32)]`), row stride `A_scale_stride`.
+ * @param B_scale B scales (`B_scale[ceil(K/32)][N]`), row stride `B_scale_stride`.
+ * @param A_stride Element stride between A payload rows.
+ * @param B_stride Element stride between B payload rows.
+ * @param D_stride Element stride between D rows.
+ * @param C_stride Element stride between C rows.
+ * @param A_scale_stride Element stride between A-scale rows.
+ * @param B_scale_stride Element stride between B-scale rows.
+ * @param full_C Writes int32 accumulator values to C when true, int8 otherwise.
+ * @param low_D Reads D as elem_t when true, acc_t otherwise.
+ * @param act Activation function applied at mvout (0 = none).
+ */
+_STATIC void tiled_matmul_mxint8(size_t M, size_t N, size_t K,
+                                 const elem_t *A_payload, const elem_t *B_payload,
+                                 const void *D, void *C,
+                                 const mx_scale_t *A_scale, const mx_scale_t *B_scale,
+                                 size_t A_stride, size_t B_stride,
+                                 size_t D_stride, size_t C_stride,
+                                 size_t A_scale_stride, size_t B_scale_stride,
+                                 bool full_C, bool low_D, int act) {
+  const size_t i_tiles = (M + DIM - 1) / DIM;
+  const size_t j_tiles = (N + DIM - 1) / DIM;
+  const size_t k_tiles = (K + DIM - 1) / DIM;
+  const size_t spad_rows = (size_t)BANK_NUM * BANK_ROWS;
+  const size_t sizeof_c = full_C ? sizeof(acc_t) : sizeof(elem_t);
+  const size_t sizeof_d = low_D ? sizeof(elem_t) : sizeof(acc_t);
+
+  // Per-invocation chunk shape (tiles). Jp is capped at 4 (a balanced default for the
+  // B-scale region vs accumulator trade-off); I and K then fill their envelope bounds.
+  size_t log2_jp = 0;
+  while (((size_t)1 << log2_jp) < j_tiles && log2_jp < 2) {
+    log2_jp++;
+  }
+  const size_t jp = (size_t)1 << log2_jp;
+  const size_t j_chunk = (j_tiles < jp) ? j_tiles : jp;
+
+  size_t i_chunk = ACC_ROWS / (2 * jp * DIM);
+  if (i_chunk > MX_SCALE_SP_ROWS / (2 * DIM)) {
+    i_chunk = MX_SCALE_SP_ROWS / (2 * DIM);
+  }
+  if (i_chunk > i_tiles) {
+    i_chunk = i_tiles;
+  }
+
+  // K chunk (in DIM tiles): A-scale lanes, B-scale region, scratchpad half (A and B
+  // payload tiles share one half), then rounded down to a whole-MX-block multiple.
+  const size_t tiles_per_block = MX_BLOCK_SIZE / DIM;
+  size_t k_chunk = (size_t)DIM * tiles_per_block;  // k_blocks <= DIM
+  {
+    const size_t kb_cap = MX_SCALE_SP_ROWS / (2 * jp);
+    if (k_chunk > kb_cap * tiles_per_block) {
+      k_chunk = kb_cap * tiles_per_block;
+    }
+    const size_t spad_cap = spad_rows / 2 / DIM / (i_chunk + j_chunk);
+    if (k_chunk > spad_cap) {
+      k_chunk = spad_cap;
+    }
+    k_chunk -= k_chunk % tiles_per_block;
+    if (k_chunk > k_tiles) {
+      k_chunk = ((k_tiles + tiles_per_block - 1) / tiles_per_block) * tiles_per_block;
+    }
+  }
+
+  if (i_chunk == 0 || j_chunk == 0 || k_chunk == 0) {
+    printf("tiled_matmul_mxint8: no valid chunk shape (i=%lu j=%lu k=%lu)\n",
+           (unsigned long)i_chunk, (unsigned long)j_chunk, (unsigned long)k_chunk);
+    exit(1);
+  }
+
+  for (size_t i0 = 0; i0 < i_tiles; i0 += i_chunk) {
+    const size_t it = (i0 + i_chunk <= i_tiles) ? i_chunk : (i_tiles - i0);
+    const size_t pad_i = (i0 + it) * DIM > M ? (i0 + it) * DIM - M : 0;
+
+    for (size_t j0 = 0; j0 < j_tiles; j0 += j_chunk) {
+      const size_t jt = (j0 + j_chunk <= j_tiles) ? j_chunk : (j_tiles - j0);
+      const size_t pad_j = (j0 + jt) * DIM > N ? (j0 + jt) * DIM - N : 0;
+
+      for (size_t k0 = 0; k0 < k_tiles; k0 += k_chunk) {
+        const size_t kt = (k0 + k_chunk <= k_tiles) ? k_chunk : (k_tiles - k0);
+        const size_t pad_k = (k0 + kt) * DIM > K ? (k0 + kt) * DIM - K : 0;
+        const size_t kb0 = (k0 * DIM) / MX_BLOCK_SIZE;
+        const bool first_k = k0 == 0;
+        const bool last_k = k0 + kt >= k_tiles;
+
+        const void *d_chunk = (first_k && D != NULL)
+            ? (const void *)((const int8_t *)D + (i0 * DIM * D_stride + j0 * DIM) * sizeof_d)
+            : NULL;
+        void *c_chunk = last_k
+            ? (void *)((int8_t *)C + (i0 * DIM * C_stride + j0 * DIM) * sizeof_c)
+            : NULL;
+
+        gemmini_loop_ws_mxint8(it, jt, kt, pad_i, pad_j, pad_k,
+            A_payload + i0 * DIM * A_stride + k0 * DIM,
+            B_payload + k0 * DIM * B_stride + j0 * DIM,
+            d_chunk, c_chunk,
+            A_scale + i0 * DIM * A_scale_stride + kb0,
+            B_scale + kb0 * B_scale_stride + j0 * DIM,
+            A_stride, B_stride, D_stride, C_stride,
+            A_scale_stride, B_scale_stride,
+            false, false, full_C, low_D,
+            /*ex_accumulate=*/!first_k, act,
+            /*a_spad_id=*/0, /*b_spad_id=*/0, /*is_resadd=*/false);
+      }
+    }
+  }
 }
 
 // weight-stationary conv loop

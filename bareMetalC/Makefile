@@ -21,6 +21,8 @@ tests = \
 	mxint8_matmul_dim16 \
 	mxint8_tiled \
 	mxint8_btb \
+	mxint8_multitile \
+	mx_bench \
 	matmul_spad \
 	raw_hazard \
 	aligned \
