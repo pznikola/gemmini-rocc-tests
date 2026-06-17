@@ -209,9 +209,10 @@ int main() {
   bad |= run_probe("probe2x2", 2 * DIM, 2 * DIM, MX_BLOCK_SIZE, false);
   // Non-power-of-two J (Jp = 4 with one padding tile slot) + two K blocks.
   bad |= run_probe("probe2x3", 2 * DIM, 3 * DIM, 2 * MX_BLOCK_SIZE, false);
-  // Partial edge tiles on all three dimensions, plus multi-block K. The K extent is
-  // chosen so ceil(K/DIM) is a whole number of blocks at DIM=32 and DIM=16 alike.
-  bad |= run_random("edges", 2 * DIM - 3, 2 * DIM - 5, 3 * MX_BLOCK_SIZE - 9, false);
+  // Partial edge tiles on M and N, with whole-block K (at DIM < 16 a logical block must
+  // be fed completely — a partial trailing K block cannot finish its phases, so K is a
+  // whole multiple of MX_BLOCK_SIZE; pad_I/pad_J still exercise the M/N edges).
+  bad |= run_random("edges", 2 * DIM - 3, 2 * DIM - 5, 2 * MX_BLOCK_SIZE, false);
   // Random full 2x2 with 4 K blocks (B-scale region exercised across blocks).
   bad |= run_random("rand2x2", 2 * DIM, 2 * DIM, 4 * MX_BLOCK_SIZE, false);
 

@@ -22,6 +22,7 @@ tests = \
 	mxint8_tiled \
 	mxint8_btb \
 	mxint8_multitile \
+	mxint8_matmul_nphase \
 	mx_bench \
 	matmul_spad \
 	raw_hazard \

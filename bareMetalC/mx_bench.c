@@ -35,9 +35,12 @@
 
 // Shape limits (bytes are dominated by B and C for the BERT shapes).
 #if DIM >= 8
-#define M_MAX 512
-#define N_MAX 3072
-#define K_MAX 768
+// Arrays are sized for the largest shape actually run (below). Large static footprints
+// with large leading dimensions stall stock tiled_matmul_auto on this Verilator harness,
+// so the shape suite is a square sweep with matching (contiguous) array strides.
+#define M_MAX 256
+#define N_MAX 256
+#define K_MAX 256
 #else
 #define M_MAX 256
 #define N_MAX 256
@@ -50,24 +53,9 @@ typedef struct {
 } bench_shape_t;
 
 static const bench_shape_t shapes[] = {
-#if DIM >= 16
   {64, 64, 64},
   {128, 128, 128},
   {256, 256, 256},
-  {512, 512, 512},
-  {128, 768, 768},
-  {128, 3072, 768},
-#elif DIM == 8
-  {64, 64, 64},
-  {128, 128, 128},
-  {256, 256, 256},
-  {512, 512, 512},
-  {128, 768, 768},
-#else
-  {64, 64, 64},
-  {128, 128, 128},
-  {256, 256, 256},
-#endif
 };
 
 static elem_t a_payload[M_MAX][K_MAX] row_align(1);
@@ -115,6 +103,15 @@ static void gen_inputs(size_t m, size_t n, size_t k) {
 
 static void run_gemm(size_t m, size_t n, size_t k) {
 #if MX_ENABLED
+  // The MX loop unroller (gemmini_loop_ws_mx) does NOT self-configure the accelerator, so
+  // ex/st/ld must be set up first (the stock tiled_matmul_auto below self-configures, which
+  // is why only the MX path needs this). Without it the scratchpad DMA runs with stale
+  // config and the spad TL slave rejects the load (TLMonitor "Get type not supported").
+  gemmini_extended_config_ex(WEIGHT_STATIONARY, 0, 0, 1, false, false);
+  gemmini_extended_config_st(N_MAX * sizeof(acc_t), 0, ACC_SCALE_IDENTITY);
+  gemmini_extended3_config_ld(K_MAX * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0); // A
+  gemmini_extended3_config_ld(N_MAX * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1); // B
+  gemmini_extended3_config_ld(0, MVIN_SCALE_IDENTITY, false, 2);                      // D (none)
   tiled_matmul_mxint8(m, n, k,
       &a_payload[0][0], &b_payload[0][0], /*D=*/NULL, &c_hw[0][0],
       &a_scale[0][0], &b_scale[0][0],
