@@ -24,6 +24,7 @@ tests = \
 	mxint8_multitile \
 	mxint8_matmul_nphase \
 	mx_bench \
+	mx_fence_probe \
 	matmul_spad \
 	raw_hazard \
 	aligned \

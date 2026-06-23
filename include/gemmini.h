@@ -227,11 +227,18 @@ static acc_scale_t_bits acc_scale_t_to_acc_scale_t_bits(acc_scale_t x) {
  */
 _STATIC void gemmini_config_mxint8_tiled(bool enable, uint32_t flags,
                                          size_t i_tiles, size_t j_tiles,
-                                         size_t log2_jp) {
+                                         size_t log2_jp, size_t k_blocks,
+                                         bool reset_k) {
 #if MX_ENABLED
+  // rs2 = {K_blocks[55:40], log2_Jp[35:32], J_tiles[31:16], I_tiles[15:0]}. K_blocks != 0
+  // lets the drain-order walk self-cycle per loop (P3 fenceless pipelining). reset_k pulses
+  // the walk back to 0: required for legacy (non-wrapping) and at the first/fenced chunk of
+  // a pipelined problem; MUST be 0 for fenceless pipelined chunks (a pulse mid-pipeline
+  // would re-zero the walk while the previous chunk is still draining).
   ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC,
-      ((uint64_t)flags << 8) | MX_CONFIG_RESET_K | (uint64_t)(enable != 0),
-      ((uint64_t)log2_jp << 32) | ((uint64_t)j_tiles << 16) | (uint64_t)i_tiles,
+      ((uint64_t)flags << 8) | (reset_k ? MX_CONFIG_RESET_K : 0) | (uint64_t)(enable != 0),
+      ((uint64_t)k_blocks << 40) | ((uint64_t)log2_jp << 32) |
+        ((uint64_t)j_tiles << 16) | (uint64_t)i_tiles,
       k_CONFIG_MXINT8);
 #else
   (void)enable;
@@ -239,11 +246,13 @@ _STATIC void gemmini_config_mxint8_tiled(bool enable, uint32_t flags,
   (void)i_tiles;
   (void)j_tiles;
   (void)log2_jp;
+  (void)k_blocks;
+  (void)reset_k;
 #endif
 }
 
 _STATIC void gemmini_config_mxint8(bool enable, uint32_t flags) {
-  gemmini_config_mxint8_tiled(enable, flags, 1, 1, 0);
+  gemmini_config_mxint8_tiled(enable, flags, 1, 1, 0, 0, /*reset_k=*/true);
 }
 
 _STATIC void gemmini_mvin_mxscale_a(const mx_scale_t *scale_ptr,
@@ -527,10 +536,32 @@ _STATIC void gemmini_loop_ws_mxint8(size_t I, size_t J, size_t K,
                                     int act,
                                     int a_spad_id,
                                     int b_spad_id,
-                                    bool is_resadd) {
-  // Scratch image for the repacked B scales (Appendix A.2 layout), sized for the whole
-  // SRAM B region. One per translation unit (baremetal tests are single-TU).
-  static mx_scale_t mxint8_b_scale_tiled[(MX_SCALE_SP_ROWS / 2) * DIM];
+                                    bool is_resadd,
+                                    // P3 pipelining: pipeline_parity < 0 = legacy (fence +
+                                    // RESET_K walk reset + scale base at region start);
+                                    // 0/1 = fenceless pipelined chunk owning that scale-SRAM
+                                    // ping-pong half (walk self-cycles via k_blocks). When
+                                    // pipelined, the caller drops the per-chunk fence except
+                                    // where fence_first is set (parity reuse / geometry change).
+                                    int pipeline_parity,
+                                    bool fence_first,
+                                    // setup_only: emit just the fence/config/scale-mvins for
+                                    // this chunk and return WITHOUT the gemmini_loop_ws_mx.
+                                    // Lets the tiler issue a pair's setup up front, then both
+                                    // LOOP_WS back-to-back (nothing between them), so the
+                                    // unroller configures both concurrent-loop slots and they
+                                    // pipeline (the non-loop-command gate at LoopMatmul.scala
+                                    // :1082 only blocks setup, never two adjacent LOOP_WS).
+                                    bool setup_only) {
+  // Scratch image for the repacked B scales (Appendix A.2 layout). Double-buffered by
+  // parity so a fenceless next chunk's repack cannot overwrite this chunk's still-reading
+  // image (Job B). Legacy (parity < 0) uses buffer 0 at full half-size; pipelined chunks
+  // use buffer[parity] up to the ping-pong quarter the tiler caps them to.
+  static mx_scale_t mxint8_b_scale_tiled[2][(MX_SCALE_SP_ROWS / 2) * DIM];
+  const int mxint8_pp_buf = (pipeline_parity > 0) ? 1 : 0;
+  // Scale-SRAM ping-pong base (rows): parity 1 chunks live in the high quarter of each
+  // region; parity 0 / legacy at the region start.
+  const size_t mxint8_pp_off = (pipeline_parity == 1) ? (size_t)(MX_SCALE_SP_ROWS / 4) : 0;
 
   // K is a count of DIM-wide tiles (exactly as `gemmini_loop_ws` consumes it), so the K
   // *element* extent is K*DIM - pad_K; the MX block count is over those elements. (Using K
@@ -586,34 +617,40 @@ _STATIC void gemmini_loop_ws_mxint8(size_t I, size_t J, size_t K,
     exit(1);
   }
 
-  // CONFIG_MXINT8 executes at the controller front-end (not RS-ordered) and its RESET_K
-  // pulse re-zeroes the drain-order walk, so all prior MX work must have drained before
-  // reconfiguring. The fence also protects the shared repack image below, which a
-  // previous invocation's scale DMA may still be reading. (Per-invocation drain is a
-  // known throughput cost on chunked problems; an RS-ordered MX config is future work.)
-  gemmini_fence();
+  // Legacy (pipeline_parity < 0): CONFIG_MXINT8's RESET_K pulse re-zeroes the drain walk,
+  // so all prior MX work must have drained first — fence. Pipelined (parity >= 0): the walk
+  // self-cycles via k_blocks and each chunk owns a scale-SRAM ping-pong half, so consecutive
+  // chunks pipeline; the caller fences only on parity reuse / geometry change (fence_first).
+  if (fence_first) {
+    gemmini_fence();
+  }
 
-  gemmini_config_mxint8_tiled(true, 0, I, J, log2_jp);
-  gemmini_mvin_mxscale_a(A_scale, 0, m_rows, k_blocks, A_scale_stride);
+  gemmini_config_mxint8_tiled(true, 0, I, J, log2_jp,
+                              (pipeline_parity >= 0) ? k_blocks : (size_t)0,
+                              /*reset_k=*/fence_first);
+  gemmini_mvin_mxscale_a(A_scale, mxint8_pp_off, m_rows, k_blocks, A_scale_stride);
 
-  // B scales: load the padded tiled image (one SRAM row per (kb, tile_j) pair). When the
-  // dense host layout already is that image (full tiles, dense stride, power-of-two J),
-  // load it directly; otherwise repack on the host first.
+  // B scales: load the padded tiled image (one SRAM row per (kb, tile_j) pair) into this
+  // chunk's ping-pong half. When the dense host layout already is that image (full tiles,
+  // dense stride, power-of-two J), load it directly; otherwise repack on the host first.
+  const size_t b_scale_addr = MX_SCALE_SP_ROWS / 2 + mxint8_pp_off;
   if (n_cols == jp * DIM && B_scale_stride == n_cols) {
-    gemmini_mvin_mxscale_b(B_scale, MX_SCALE_SP_ROWS / 2, k_blocks * jp, DIM, DIM);
+    gemmini_mvin_mxscale_b(B_scale, b_scale_addr, k_blocks * jp, DIM, DIM);
   } else {
     mxint8_repack_b_scales_tiled(B_scale, k_blocks, n_cols, B_scale_stride, jp,
-                                 mxint8_b_scale_tiled);
-    gemmini_mvin_mxscale_b(mxint8_b_scale_tiled, MX_SCALE_SP_ROWS / 2, k_blocks * jp,
+                                 mxint8_b_scale_tiled[mxint8_pp_buf]);
+    gemmini_mvin_mxscale_b(mxint8_b_scale_tiled[mxint8_pp_buf], b_scale_addr, k_blocks * jp,
                            DIM, DIM);
   }
 
-  gemmini_loop_ws_mx(I, J, K, pad_I, pad_J, pad_K,
-                     A_payload, B_payload, D, C,
-                     A_stride, B_stride, D_stride, C_stride,
-                     A_transpose, B_transpose,
-                     full_C, low_D, ex_accumulate, act,
-                     a_spad_id, b_spad_id, is_resadd, log2_jp);
+  if (!setup_only) {
+    gemmini_loop_ws_mx(I, J, K, pad_I, pad_J, pad_K,
+                       A_payload, B_payload, D, C,
+                       A_stride, B_stride, D_stride, C_stride,
+                       A_transpose, B_transpose,
+                       full_C, low_D, ex_accumulate, act,
+                       a_spad_id, b_spad_id, is_resadd, log2_jp);
+  }
 }
 
 /**
@@ -670,9 +707,15 @@ _STATIC void tiled_matmul_mxint8(size_t M, size_t N, size_t K,
   const size_t jp = (size_t)1 << log2_jp;
   const size_t j_chunk = (j_tiles < jp) ? j_tiles : jp;
 
+  // Accumulator output uses HALF of ACC_ROWS per loop (the unroller's other half is the
+  // concurrent-loop double-buffer; the MX tag->tile recovery masks it off,
+  // `mx_acc_tiles_half = acc_rows/(2*DIM)`). The scale SRAM is additionally ping-ponged by
+  // loop parity (P3): each in-flight chunk owns a QUARTER of each scale region (A:
+  // MX_SCALE_SP_ROWS/4 rows, B likewise), so a fenceless next chunk's scale mvin cannot
+  // clobber this chunk's still-draining scales. Hence the scale bound is /4, not /2.
   size_t i_chunk = ACC_ROWS / (2 * jp * DIM);
-  if (i_chunk > MX_SCALE_SP_ROWS / (2 * DIM)) {
-    i_chunk = MX_SCALE_SP_ROWS / (2 * DIM);
+  if (i_chunk > MX_SCALE_SP_ROWS / (4 * DIM)) {
+    i_chunk = MX_SCALE_SP_ROWS / (4 * DIM);
   }
   if (i_chunk > i_tiles) {
     i_chunk = i_tiles;
@@ -683,7 +726,7 @@ _STATIC void tiled_matmul_mxint8(size_t M, size_t N, size_t K,
   const size_t tiles_per_block = MX_BLOCK_SIZE / DIM;
   size_t k_chunk = (size_t)DIM * tiles_per_block;  // k_blocks <= DIM
   {
-    const size_t kb_cap = MX_SCALE_SP_ROWS / (2 * jp);
+    const size_t kb_cap = MX_SCALE_SP_ROWS / (4 * jp);
     if (k_chunk > kb_cap * tiles_per_block) {
       k_chunk = kb_cap * tiles_per_block;
     }
@@ -702,6 +745,18 @@ _STATIC void tiled_matmul_mxint8(size_t M, size_t N, size_t K,
            (unsigned long)i_chunk, (unsigned long)j_chunk, (unsigned long)k_chunk);
     exit(1);
   }
+
+  // P3 pipelining: independent output-tile chunks (distinct (i0,j0)) run fenceless in
+  // depth-2 pairs through the unroller's 2 concurrent-loop slots, alternating the scale-SRAM
+  // ping-pong half by `pp` (0/1). A fence (+ RESET_K, which lands the walk back on parity 0)
+  // is inserted only when needed: the first chunk, every 3rd chunk (parity-0 reuse beyond
+  // the 2-deep window), a geometry change (the per-loop config reg is global, so two paired
+  // chunks must share it_/jt_/kt_), or any K-chunked problem (K-continuation chunks accumulate
+  // into the same tile and are inherently serial). `pp` mirrors the hardware walk parity,
+  // which RESET_K zeroes and the kb-wrap toggles once per chunk, so the two stay in lockstep.
+  const bool k_chunked = (k_chunk < k_tiles);
+  size_t since_fence = 2;          // forces a fence (new pair) before the very first chunk
+  size_t prev_it = 0, prev_jt = 0, prev_kt = 0;
 
   for (size_t i0 = 0; i0 < i_tiles; i0 += i_chunk) {
     const size_t it = (i0 + i_chunk <= i_tiles) ? i_chunk : (i_tiles - i0);
@@ -725,6 +780,16 @@ _STATIC void tiled_matmul_mxint8(size_t M, size_t N, size_t K,
             ? (void *)((int8_t *)C + (i0 * DIM * C_stride + j0 * DIM) * sizeof_c)
             : NULL;
 
+        // Depth-2 fenceless pairing: even chunks start a pair (fence + RESET_K, parity 0),
+        // the next same-geometry chunk pipelines fenceless on parity 1 (own scale-SRAM half).
+        // (A deferred-run variant that issued both LOOP_WS back-to-back was tried and made it
+        // worse: the chunks still do not overlap — single drain walk + one BlockScaleUnit —
+        // and spad_id 1/2 only added load traffic. So pairing stays per-chunk; see
+        // PERF_ANALYSIS.md "deferred pairing".)
+        const bool geom_same = (it == prev_it && jt == prev_jt && kt == prev_kt);
+        const bool do_fence = k_chunked || (since_fence >= 2) || !geom_same;
+        const int pp = do_fence ? 0 : (int)since_fence;
+
         gemmini_loop_ws_mxint8(it, jt, kt, pad_i, pad_j, pad_k,
             A_payload + i0 * DIM * A_stride + k0 * DIM,
             B_payload + k0 * DIM * B_stride + j0 * DIM,
@@ -735,7 +800,11 @@ _STATIC void tiled_matmul_mxint8(size_t M, size_t N, size_t K,
             A_scale_stride, B_scale_stride,
             false, false, full_C, low_D,
             /*ex_accumulate=*/!first_k, act,
-            /*a_spad_id=*/0, /*b_spad_id=*/0, /*is_resadd=*/false);
+            /*a_spad_id=*/0, /*b_spad_id=*/0, /*is_resadd=*/false,
+            /*pipeline_parity=*/pp, /*fence_first=*/do_fence, /*setup_only=*/false);
+
+        since_fence = do_fence ? 1 : (since_fence + 1);
+        prev_it = it; prev_jt = jt; prev_kt = kt;
       }
     }
   }

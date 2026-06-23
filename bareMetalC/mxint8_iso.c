@@ -106,7 +106,8 @@ static void mxint8_tiled_hw(size_t k) {
       /*A_scale_stride=*/KB_MAX, /*B_scale_stride=*/N,
       /*A_transpose=*/false, /*B_transpose=*/false,
       /*full_C=*/true, /*low_D=*/false, /*ex_accumulate=*/false,
-      /*act=*/0, /*a_spad_id=*/0, /*b_spad_id=*/0, /*is_resadd=*/false);
+      /*act=*/0, /*a_spad_id=*/0, /*b_spad_id=*/0, /*is_resadd=*/false,
+      /*pipeline_parity=*/-1, /*fence_first=*/true, /*setup_only=*/false);
   gemmini_fence();
 }
 
