@@ -5,7 +5,12 @@
 
 #define DISABLE 0
 
-#define INCREMENTAL_COUNTERS 44
+// Highest incremental (event) counter code. Codes above this are external
+// counters (counter_configure subtracts this offset and sets the external bit).
+// Bumped (44 -> 50) to make room for the MX scale-load + serialization diagnostic
+// events; the external-counter macros below are defined relative to it, so they shift
+// automatically and keep mapping to the same CounterExternal indices.
+#define INCREMENTAL_COUNTERS 50
 
 // All existing Gemmini performance counters
 
@@ -65,6 +70,16 @@
 
 #define LOOP_MATMUL_ACTIVE_CYCLES 43
 #define TRANSPOSE_PRELOAD_UNROLLER_ACTIVE_CYCLES 44
+
+// MX scale-load diagnostics (must match CounterFile.scala)
+#define MX_SCALE_DMA_ACTIVE_CYCLE 45
+#define MX_SCALE_DMA_SOLO_CYCLE 46
+
+// MX serialization diagnostics (must match CounterFile.scala)
+#define MX_DBG_WAIT_CMD_CYCLE 47
+#define MX_DBG_ENQ_NOT_READY_CYCLE 48
+#define MX_DBG_REQ_STALL_CYCLE 49
+#define MX_DBG_DRAINING_CYCLE 50
 
 #define RESERVATION_STATION_LD_COUNT (INCREMENTAL_COUNTERS + 1)
 #define RESERVATION_STATION_ST_COUNT (INCREMENTAL_COUNTERS + 2)

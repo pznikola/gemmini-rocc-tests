@@ -169,27 +169,32 @@ static int run_shape(const bench_shape_t *s) {
   // actual DMA engines (capture the scale-load too if it shares the read DMA); DMA_TLB_MISS
   // = TLB thrashing (the per-row scale DMA is a prime suspect); SCRATCHPAD_B_WAIT = mesh feed
   // starved; LOOP_MATMUL_ACTIVE = unroller busy; RS_FULL = back-pressure.
-  counter_configure(0, EXE_ACTIVE_CYCLE);
-  counter_configure(1, RDMA_ACTIVE_CYCLE);
-  counter_configure(2, WDMA_ACTIVE_CYCLE);
-  counter_configure(3, DMA_TLB_MISS_CYCLE);
-  counter_configure(4, SCRATCHPAD_B_WAIT_CYCLE);
+  // B-feed mechanism probe: spadB_wait dominates (85% in MX vs 37% stock). Discriminate WHY
+  // the B source can't deliver. overlap_haz = mesh can't start the next matmul until the
+  // previous output has drained (drain serialization, the prime suspect); preload_haz =
+  // preload hazard; spadA_wait vs spadB_wait = is the starvation B-specific or general feed;
+  // ctrlq_block = the mesh control queue is blocked; rs_active = RS occupancy.
+  counter_configure(0, EXE_ACTIVE_CYCLE);            // compute state
+  counter_configure(1, MX_DBG_WAIT_CMD_CYCLE);       // waiting_for_cmd (RS-starved)
+  counter_configure(2, MX_DBG_ENQ_NOT_READY_CYCLE);  // ctrl-q can't accept (gates read issue)
+  counter_configure(3, MX_DBG_REQ_STALL_CYCLE);      // matmul entry blocked (mesh.req.ready low)
+  counter_configure(4, MX_DBG_DRAINING_CYCLE);       // mesh emitting committed output (drain)
   counter_configure(5, LOOP_MATMUL_ACTIVE_CYCLES);
   counter_configure(6, RESERVATION_STATION_FULL_CYCLES);
-  counter_configure(7, LOAD_DMA_WAIT_CYCLE);
+  counter_configure(7, SCRATCHPAD_B_WAIT_CYCLE);
   counter_reset();
   const uint64_t start = read_cycles();
   run_gemm(s->m, s->n, s->k);
   const uint64_t end = read_cycles();
   gemmini_fence();
-  const uint32_t c_active   = counter_read(0);
-  const uint32_t c_rdbytes  = counter_read(1);  // RDMA_ACTIVE
-  const uint32_t c_wrbytes  = counter_read(2);  // WDMA_ACTIVE
-  const uint32_t c_ldactive = counter_read(3);  // DMA_TLB_MISS
-  const uint32_t c_stactive = counter_read(4);  // SCRATCHPAD_B_WAIT
+  const uint32_t c_active   = counter_read(0);  // EXE_ACTIVE (compute)
+  const uint32_t c_rdbytes  = counter_read(1);  // WAIT_CMD
+  const uint32_t c_wrbytes  = counter_read(2);  // ENQ_NOT_READY
+  const uint32_t c_ldactive = counter_read(3);  // REQ_STALL
+  const uint32_t c_stactive = counter_read(4);  // DRAINING
   const uint32_t c_ldwait   = counter_read(5);  // LOOP_MATMUL_ACTIVE
   const uint32_t c_stwait   = counter_read(6);  // RS_FULL
-  const uint32_t c_rsactive = counter_read(7);  // LOAD_DMA_WAIT
+  const uint32_t c_rsactive = counter_read(7);  // SCRATCHPAD_B_WAIT
 
   int bad = 0;
   for (int r = 0; r < GOLDEN_ROWS; r++) {
@@ -213,8 +218,8 @@ static int run_shape(const bench_shape_t *s) {
          (unsigned long long)ideal, (unsigned long long)util_pct,
          bad ? "FAIL" : "PASS");
   printf("MXCOUNT,impl=%s,dim=%d,M=%lu,N=%lu,K=%lu,cycles=%llu,exe_active=%u,"
-         "rdma_active=%u,wdma_active=%u,tlb_miss=%u,spadB_wait=%u,loopmm_active=%u,"
-         "rs_full=%u,ld_dma_wait=%u\n",
+         "wait_cmd=%u,enq_not_ready=%u,req_stall=%u,draining=%u,loopmm_active=%u,"
+         "rs_full=%u,spadB_wait=%u\n",
 #if MX_ENABLED
          "mx",
 #else
