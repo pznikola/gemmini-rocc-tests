@@ -34,18 +34,11 @@
 #define GOLDEN_ROWS 8
 
 // Shape limits (bytes are dominated by B and C for the BERT shapes).
-#if DIM >= 8
-// Arrays are sized for the largest shape actually run (below). Large static footprints
-// with large leading dimensions stall stock tiled_matmul_auto on this Verilator harness,
-// so the shape suite is a square sweep with matching (contiguous) array strides.
+// Known-good array sizing (matches the original suite). Tight 64-strides deadlocked the MX
+// gemm (separate non-square/KB issue), so keep the original 256 strides for the trace.
 #define M_MAX 256
 #define N_MAX 256
 #define K_MAX 256
-#else
-#define M_MAX 256
-#define N_MAX 256
-#define K_MAX 256
-#endif
 #define KB_MAX ((K_MAX + 31) / 32)
 
 typedef struct {
@@ -174,27 +167,58 @@ static int run_shape(const bench_shape_t *s) {
   // previous output has drained (drain serialization, the prime suspect); preload_haz =
   // preload hazard; spadA_wait vs spadB_wait = is the starvation B-specific or general feed;
   // ctrlq_block = the mesh control queue is blocked; rs_active = RS occupancy.
-  counter_configure(0, EXE_ACTIVE_CYCLE);            // compute state
-  counter_configure(1, MX_DBG_WAIT_CMD_CYCLE);       // waiting_for_cmd (RS-starved)
-  counter_configure(2, MX_DBG_ENQ_NOT_READY_CYCLE);  // ctrl-q can't accept (gates read issue)
-  counter_configure(3, MX_DBG_REQ_STALL_CYCLE);      // matmul entry blocked (mesh.req.ready low)
-  counter_configure(4, MX_DBG_DRAINING_CYCLE);       // mesh emitting committed output (drain)
-  counter_configure(5, LOOP_MATMUL_ACTIVE_CYCLES);
-  counter_configure(6, RESERVATION_STATION_FULL_CYCLES);
-  counter_configure(7, SCRATCHPAD_B_WAIT_CYCLE);
+  // Phase-0 gate partition: split the 86% waiting_for_cmd. no_cmd = RS not issuing (upstream
+  // dependency); cmd_blocked = EX has a command but a config/hazard barrier holds it;
+  // matmul_in_progress / hold_not_drain = mesh tag occupancy (computed-but-not-draining).
+  // RS-internal partition: when the EX controller has no command (no_cmd), why? ex_ready =
+  // RS has a ready EX entry it isn't issuing (issue-handshake gate); ex_blocked = unissued
+  // EX entries dependency-blocked (dependency gate); ex_inflight = EX entries issued but not
+  // completed (completion-latency gate); ld_inflight = loads outstanding (ld_ahead gate).
+  // rs_full re-included in the SAME run to settle CPU-vs-hardware with no cross-probe.
+  // Phase-0b DAE-inversion partition: split the ~86% no_cmd (EX controller starved) into its
+  // true cause. blk_scale = an unissued EX entry is dep-blocked with a live scale-mvin dep
+  // (the decoupled-access-execute inversion: matmul issue gated on scale-DMA *completion*);
+  // blk_scale_only = the scale dep is its ONLY blocker (relaxing it would free the matmul);
+  // blk_nonscale = blocked by some non-scale dep (a different gate); ex_pool_empty = no EX
+  // entry at all (unroller not delivering: idle or ld_ahead/upstream stall). ex_ready = RS
+  // has a ready EX it isn't issuing (consume/FSM gate); ex_inflight = issued-not-completed
+  // (completion latency); ld_blocked = loads dep-blocked. Decision: if blk_scale ~= no_cmd,
+  // the scale-mvin completion gate is confirmed => Phase 1A (relax the matmul->scale dep).
+  // Phase-0b split of the dominant ex_pool_empty (~82%): is the unroller IDLE (no loop to
+  // run => command/loop-level starvation, Phase 1C) or BUSY-but-not-delivering (loopmm_active
+  // high while the pool is empty => ld_ahead/feed stall inside a chunk, Phase 1B)? loopmm_active
+  // and rs_active are stock counters already in the RTL, so this needs no sim rebuild. Also
+  // observe mesh tag occupancy (matmul_in_progress), the config barrier (cmd_blocked), and the
+  // residual non-scale EX block.
+  // Phase-0c DMA localization of the ~77% inter-chunk idle: is the mesh starved because the
+  // next chunk's payloads load serially (fence -> cold DMA, no overlap with prior compute)?
+  // load_active/load_dma_wait = payload load controller; rdma_active = read DMA engine; tlb_miss
+  // = TLB thrash; scale_dma = scale-mvin DMA. Compared against mesh-busy (matmul_in_progress)
+  // and unroller-configured (loopmm). All are stock counters (valid in both sims), no rebuild.
+  counter_configure(0, MX_DBG_NO_CMD_CYCLE);                // EX controller starved (denominator)
+  counter_configure(1, MX_DBG_MATMUL_IN_PROGRESS_CYCLE);    // mesh busy (reference)
+  counter_configure(2, LOAD_ACTIVE_CYCLE);                  // payload load DMA active
+  counter_configure(3, LOAD_DMA_WAIT_CYCLE);                // load controller waiting on DMA
+  counter_configure(4, RDMA_ACTIVE_CYCLE);                  // read-DMA engine active
+  counter_configure(5, DMA_TLB_MISS_CYCLE);                 // TLB miss stalls
+  counter_configure(6, MX_SCALE_DMA_ACTIVE_CYCLE);          // scale-mvin DMA active
+  counter_configure(7, LOOP_MATMUL_ACTIVE_CYCLES);          // unroller configured (reference)
   counter_reset();
+#if MX_ENABLED
+  g_mx_repack_cyc = 0; g_mx_issue_cyc = 0;  // Phase-0c CPU-cost localization
+#endif
   const uint64_t start = read_cycles();
   run_gemm(s->m, s->n, s->k);
   const uint64_t end = read_cycles();
   gemmini_fence();
-  const uint32_t c_active   = counter_read(0);  // EXE_ACTIVE (compute)
-  const uint32_t c_rdbytes  = counter_read(1);  // WAIT_CMD
-  const uint32_t c_wrbytes  = counter_read(2);  // ENQ_NOT_READY
-  const uint32_t c_ldactive = counter_read(3);  // REQ_STALL
-  const uint32_t c_stactive = counter_read(4);  // DRAINING
-  const uint32_t c_ldwait   = counter_read(5);  // LOOP_MATMUL_ACTIVE
-  const uint32_t c_stwait   = counter_read(6);  // RS_FULL
-  const uint32_t c_rsactive = counter_read(7);  // SCRATCHPAD_B_WAIT
+  const uint32_t c_no_cmd     = counter_read(0);  // NO_CMD
+  const uint32_t c_mm_prog    = counter_read(1);  // MATMUL_IN_PROGRESS
+  const uint32_t c_ld_active  = counter_read(2);  // LOAD_ACTIVE
+  const uint32_t c_ld_wait    = counter_read(3);  // LOAD_DMA_WAIT
+  const uint32_t c_rdma       = counter_read(4);  // RDMA_ACTIVE
+  const uint32_t c_tlb_miss   = counter_read(5);  // DMA_TLB_MISS
+  const uint32_t c_scale_dma  = counter_read(6);  // MX_SCALE_DMA_ACTIVE
+  const uint32_t c_loopmm     = counter_read(7);  // LOOP_MATMUL_ACTIVE
 
   int bad = 0;
   for (int r = 0; r < GOLDEN_ROWS; r++) {
@@ -217,17 +241,23 @@ static int run_shape(const bench_shape_t *s) {
          (unsigned long long)cycles, (unsigned long long)macs,
          (unsigned long long)ideal, (unsigned long long)util_pct,
          bad ? "FAIL" : "PASS");
-  printf("MXCOUNT,impl=%s,dim=%d,M=%lu,N=%lu,K=%lu,cycles=%llu,exe_active=%u,"
-         "wait_cmd=%u,enq_not_ready=%u,req_stall=%u,draining=%u,loopmm_active=%u,"
-         "rs_full=%u,spadB_wait=%u\n",
+  printf("MXCOUNT,impl=%s,dim=%d,M=%lu,N=%lu,K=%lu,cycles=%llu,no_cmd=%u,"
+         "matmul_in_progress=%u,load_active=%u,load_dma_wait=%u,rdma_active=%u,"
+         "tlb_miss=%u,scale_dma=%u,loopmm_active=%u\n",
 #if MX_ENABLED
          "mx",
 #else
          "stock",
 #endif
          DIM, (unsigned long)s->m, (unsigned long)s->n, (unsigned long)s->k,
-         (unsigned long long)cycles, c_active, c_rdbytes, c_wrbytes, c_ldactive,
-         c_stactive, c_ldwait, c_stwait, c_rsactive);
+         (unsigned long long)cycles, c_no_cmd, c_mm_prog, c_ld_active, c_ld_wait,
+         c_rdma, c_tlb_miss, c_scale_dma, c_loopmm);
+#if MX_ENABLED
+  printf("MXCPU,impl=mx,dim=%d,M=%lu,N=%lu,K=%lu,cycles=%llu,repack_cyc=%llu,issue_cyc=%llu\n",
+         DIM, (unsigned long)s->m, (unsigned long)s->n, (unsigned long)s->k,
+         (unsigned long long)cycles, (unsigned long long)g_mx_repack_cyc,
+         (unsigned long long)g_mx_issue_cyc);
+#endif
   return bad;
 }
 

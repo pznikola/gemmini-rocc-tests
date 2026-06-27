@@ -502,17 +502,41 @@ _STATIC void mxint8_repack_b_scales_tiled(const mx_scale_t *b_scale,
   const size_t j_tiles = (n + DIM - 1) / DIM;
   const mx_scale_t neutral = (mx_scale_t)127;  // E8M0 encode(0): 2^0
 
+  // Branchless per-tile: copy the valid prefix contiguously, neutral-fill the rest. Hoisting
+  // the (tj<j_tiles && col<n) test out of the DIM-lane loop is the bulk of the win (the old
+  // per-lane branch + index math ran ~20 cyc/elem on the in-order Rocket; this repack was 84%
+  // of MX 256³ runtime). mx_scale_t is a byte, so these are simple byte copies/fills.
   for (size_t kb = 0; kb < k_blocks; kb++) {
+    const mx_scale_t *src_row = &b_scale[kb * b_scale_stride];
     for (size_t tj = 0; tj < jp; tj++) {
       mx_scale_t *row = &out[(kb * jp + tj) * DIM];
-      for (size_t lane = 0; lane < DIM; lane++) {
-        const size_t col = tj * DIM + lane;
-        row[lane] = (tj < j_tiles && col < n) ? b_scale[kb * b_scale_stride + col]
-                                              : neutral;
+      const size_t base = tj * DIM;
+      size_t valid = 0;
+      if (tj < j_tiles && base < n) {
+        valid = n - base;
+        if (valid > (size_t)DIM) valid = DIM;
       }
+      for (size_t l = 0; l < valid; l++) row[l] = src_row[base + l];
+      for (size_t l = valid; l < (size_t)DIM; l++) row[l] = neutral;
     }
   }
 }
+
+// Phase-0c CPU-cost localization (temporary, observation-only): accumulate the host cycles
+// spent in the per-chunk B-scale repack vs the per-chunk gemmini instruction issue, so we can
+// attribute the ~85% accelerator-idle (CPU-bound) time. Read/reset by mx_bench.
+static uint64_t g_mx_repack_cyc = 0;
+static uint64_t g_mx_issue_cyc = 0;
+static inline uint64_t mx_rdcycle_(void) { uint64_t c; __asm__ volatile ("rdcycle %0" : "=r"(c)); return c; }
+
+// B-scale tiling reuse (Phase 1 fix). The repacked B-scale image depends only on the
+// (j-chunk, k-chunk), NOT on the output-row chunk i0, yet gemmini_loop_ws_mxint8 re-tiled it
+// for every i0 (the dominant MX host cost: 84% of 256³ runtime). When the tiler sets
+// g_mx_btile_cache to a per-(j,k) buffer, gemmini_loop_ws_mxint8 repacks into it only the
+// first time (g_mx_btile_valid == false) and reuses it thereafter. NULL = legacy per-chunk
+// repack into the internal ping-pong buffer (all direct callers keep that behavior).
+static mx_scale_t *g_mx_btile_cache = NULL;
+static bool g_mx_btile_valid = false;
 
 _STATIC void gemmini_loop_ws_mxint8(size_t I, size_t J, size_t K,
                                     size_t pad_I, size_t pad_J, size_t pad_K,
@@ -637,19 +661,28 @@ _STATIC void gemmini_loop_ws_mxint8(size_t I, size_t J, size_t K,
   if (n_cols == jp * DIM && B_scale_stride == n_cols) {
     gemmini_mvin_mxscale_b(B_scale, b_scale_addr, k_blocks * jp, DIM, DIM);
   } else {
-    mxint8_repack_b_scales_tiled(B_scale, k_blocks, n_cols, B_scale_stride, jp,
-                                 mxint8_b_scale_tiled[mxint8_pp_buf]);
-    gemmini_mvin_mxscale_b(mxint8_b_scale_tiled[mxint8_pp_buf], b_scale_addr, k_blocks * jp,
-                           DIM, DIM);
+    // Tile into the tiler-provided per-(j,k) cache when present (repack once, reuse across
+    // i0); else the legacy internal ping-pong buffer (re-tiled every call).
+    mx_scale_t *btile = (g_mx_btile_cache != NULL) ? g_mx_btile_cache
+                                                   : mxint8_b_scale_tiled[mxint8_pp_buf];
+    if (!(g_mx_btile_cache != NULL && g_mx_btile_valid)) {
+      const uint64_t _rp0 = mx_rdcycle_();
+      mxint8_repack_b_scales_tiled(B_scale, k_blocks, n_cols, B_scale_stride, jp, btile);
+      g_mx_repack_cyc += mx_rdcycle_() - _rp0;
+      if (g_mx_btile_cache != NULL) g_mx_btile_valid = true;
+    }
+    gemmini_mvin_mxscale_b(btile, b_scale_addr, k_blocks * jp, DIM, DIM);
   }
 
   if (!setup_only) {
+    const uint64_t _is0 = mx_rdcycle_();
     gemmini_loop_ws_mx(I, J, K, pad_I, pad_J, pad_K,
                        A_payload, B_payload, D, C,
                        A_stride, B_stride, D_stride, C_stride,
                        A_transpose, B_transpose,
                        full_C, low_D, ex_accumulate, act,
                        a_spad_id, b_spad_id, is_resadd, log2_jp);
+    g_mx_issue_cyc += mx_rdcycle_() - _is0;
   }
 }
 
@@ -758,6 +791,20 @@ _STATIC void tiled_matmul_mxint8(size_t M, size_t N, size_t K,
   size_t since_fence = 2;          // forces a fence (new pair) before the very first chunk
   size_t prev_it = 0, prev_jt = 0, prev_kt = 0;
 
+  // Phase 1 fix: the repacked B-scale image depends only on (j-chunk, k-chunk), not on the
+  // output-row chunk i0, but gemmini_loop_ws_mxint8 re-tiled it for every i0 — 84% of MX
+  // runtime. Cache one tiled image per (jc, kc) and reuse across the i0 sweep. One slot is
+  // (MX_SCALE_SP_ROWS/2)*DIM bytes (the max image, per the k_blocks*jp <= MX_SCALE_SP_ROWS/2
+  // envelope check). Fall back to per-chunk repack if the (jc,kc) grid exceeds the cache.
+  static mx_scale_t mx_btile_cache[4][(MX_SCALE_SP_ROWS / 2) * DIM];
+  static bool mx_btile_valid[4];
+  const size_t mx_KC = (k_tiles + k_chunk - 1) / k_chunk;
+  const size_t mx_JC = (j_tiles + j_chunk - 1) / j_chunk;
+  const bool mx_use_btile_cache = (mx_JC * mx_KC <= 4);
+  if (mx_use_btile_cache) {
+    for (size_t t = 0; t < mx_JC * mx_KC; t++) mx_btile_valid[t] = false;
+  }
+
   for (size_t i0 = 0; i0 < i_tiles; i0 += i_chunk) {
     const size_t it = (i0 + i_chunk <= i_tiles) ? i_chunk : (i_tiles - i0);
     const size_t pad_i = (i0 + it) * DIM > M ? (i0 + it) * DIM - M : 0;
@@ -790,6 +837,17 @@ _STATIC void tiled_matmul_mxint8(size_t M, size_t N, size_t K,
         const bool do_fence = k_chunked || (since_fence >= 2) || !geom_same;
         const int pp = do_fence ? 0 : (int)since_fence;
 
+        // Point gemmini_loop_ws_mxint8 at this (jc,kc)'s cached tiled B-scale image so it
+        // repacks only on the first i0 and reuses it thereafter.
+        size_t mx_slot = 0;
+        if (mx_use_btile_cache) {
+          mx_slot = (j0 / j_chunk) * mx_KC + (k0 / k_chunk);
+          g_mx_btile_cache = mx_btile_cache[mx_slot];
+          g_mx_btile_valid = mx_btile_valid[mx_slot];
+        } else {
+          g_mx_btile_cache = NULL;
+        }
+
         gemmini_loop_ws_mxint8(it, jt, kt, pad_i, pad_j, pad_k,
             A_payload + i0 * DIM * A_stride + k0 * DIM,
             B_payload + k0 * DIM * B_stride + j0 * DIM,
@@ -802,6 +860,9 @@ _STATIC void tiled_matmul_mxint8(size_t M, size_t N, size_t K,
             /*ex_accumulate=*/!first_k, act,
             /*a_spad_id=*/0, /*b_spad_id=*/0, /*is_resadd=*/false,
             /*pipeline_parity=*/pp, /*fence_first=*/do_fence, /*setup_only=*/false);
+
+        if (mx_use_btile_cache) mx_btile_valid[mx_slot] = g_mx_btile_valid;
+        g_mx_btile_cache = NULL;  // restore default for any other (direct) callers
 
         since_fence = do_fence ? 1 : (since_fence + 1);
         prev_it = it; prev_jt = jt; prev_kt = kt;
