@@ -153,9 +153,13 @@ static int check_row(size_t row, size_t n, size_t k) {
 }
 
 static int run_shape(const bench_shape_t *s) {
+  printf("TRACE,enter_run_shape,M=%lu,N=%lu,K=%lu\n",
+         (unsigned long)s->m, (unsigned long)s->n, (unsigned long)s->k);
   gen_inputs(s->m, s->n, s->k);
+  printf("TRACE,gen_inputs_done,M=%lu\n", (unsigned long)s->m);
 
   gemmini_flush(0);
+  printf("TRACE,flush_done,M=%lu\n", (unsigned long)s->m);
   // Hazard/attribution counters (P-A.2): localize where the execute pipeline spends
   // cycles. Configured outside the timed region so MXBENCH cycle counts are unaffected.
   // D1 diagnostic set (no RTL rebuild): localize the ~127k idle. RDMA/WDMA_ACTIVE = the
@@ -207,9 +211,11 @@ static int run_shape(const bench_shape_t *s) {
 #if MX_ENABLED
   g_mx_repack_cyc = 0; g_mx_issue_cyc = 0;  // Phase-0c CPU-cost localization
 #endif
+  printf("TRACE,pre_run_gemm,M=%lu\n", (unsigned long)s->m);
   const uint64_t start = read_cycles();
   run_gemm(s->m, s->n, s->k);
   const uint64_t end = read_cycles();
+  printf("TRACE,post_run_gemm,M=%lu\n", (unsigned long)s->m);
   gemmini_fence();
   const uint32_t c_no_cmd     = counter_read(0);  // NO_CMD
   const uint32_t c_mm_prog    = counter_read(1);  // MATMUL_IN_PROGRESS
@@ -268,6 +274,8 @@ int main() {
     exit(1);
   }
 #endif
+
+  printf("TRACE,enter_main\n");
 
   int bad = 0;
   for (size_t s = 0; s < sizeof(shapes) / sizeof(shapes[0]); s++) {
