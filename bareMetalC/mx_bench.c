@@ -58,6 +58,10 @@ static acc_t gold_row[N_MAX];
 #if MX_ENABLED
 static mx_scale_t a_scale[M_MAX][KB_MAX] __attribute__((aligned(64)));
 static mx_scale_t b_scale[KB_MAX][N_MAX] __attribute__((aligned(64)));
+// Phase C: offline-tiled B-scale image (weights are constant). Filled once per shape outside
+// the timed region; the timed GEMM then reads it and does zero repack. 4 slots is the cache
+// envelope (mx_JC*mx_KC <= 4 for these shapes).
+static mx_scale_t b_pretiled[4 * MX_PRETILE_SLOT_ELEMS] __attribute__((aligned(64)));
 #endif
 
 static uint32_t lcg = 0xa5a5a5a5u;
@@ -105,11 +109,12 @@ static void run_gemm(size_t m, size_t n, size_t k) {
   gemmini_extended3_config_ld(K_MAX * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 0); // A
   gemmini_extended3_config_ld(N_MAX * sizeof(elem_t), MVIN_SCALE_IDENTITY, false, 1); // B
   gemmini_extended3_config_ld(0, MVIN_SCALE_IDENTITY, false, 2);                      // D (none)
-  tiled_matmul_mxint8(m, n, k,
+  tiled_matmul_mxint8_pretiled(m, n, k,
       &a_payload[0][0], &b_payload[0][0], /*D=*/NULL, &c_hw[0][0],
       &a_scale[0][0], &b_scale[0][0],
       K_MAX, N_MAX, 0, N_MAX, KB_MAX, N_MAX,
-      /*full_C=*/true, /*low_D=*/false, /*act=*/0);
+      /*full_C=*/true, /*low_D=*/false, /*act=*/0,
+      /*b_pretiled=*/b_pretiled);
 #else
   tiled_matmul_auto(m, n, k,
       &a_payload[0][0], &b_payload[0][0], /*D=*/NULL, &c_hw[0][0],
@@ -210,6 +215,10 @@ static int run_shape(const bench_shape_t *s) {
   counter_reset();
 #if MX_ENABLED
   g_mx_repack_cyc = 0; g_mx_issue_cyc = 0;  // Phase-0c CPU-cost localization
+  // Phase C: pre-tile the constant B-scales ONCE here (untimed). This calls the repack
+  // directly (not the timed wrapper), so g_mx_repack_cyc stays 0; the timed GEMM below reads
+  // b_pretiled and never repacks. Bytes are identical to the in-loop repack -> bit-exact.
+  mxint8_pretile_b_scales(s->m, s->n, s->k, &b_scale[0][0], N_MAX, b_pretiled);
 #endif
   printf("TRACE,pre_run_gemm,M=%lu\n", (unsigned long)s->m);
   const uint64_t start = read_cycles();

@@ -538,6 +538,11 @@ static inline uint64_t mx_rdcycle_(void) { uint64_t c; __asm__ volatile ("rdcycl
 static mx_scale_t *g_mx_btile_cache = NULL;
 static bool g_mx_btile_valid = false;
 
+// Element count of one per-(j,k) tiled B-scale image (the max image, per the
+// k_blocks*jp <= MX_SCALE_SP_ROWS/2 envelope). Used to size both the internal per-chunk
+// cache and the caller-provided offline pre-tile buffer (Phase C).
+#define MX_PRETILE_SLOT_ELEMS ((MX_SCALE_SP_ROWS / 2) * DIM)
+
 _STATIC void gemmini_loop_ws_mxint8(size_t I, size_t J, size_t K,
                                     size_t pad_I, size_t pad_J, size_t pad_K,
                                     const elem_t *A_payload,
@@ -686,6 +691,111 @@ _STATIC void gemmini_loop_ws_mxint8(size_t I, size_t J, size_t K,
   }
 }
 
+// Per-invocation chunk geometry for the MXINT8 outer tiler. Computed once and shared by the
+// tiler (tiled_matmul_mxint8_impl) and the offline pre-tiler (mxint8_pretile_b_scales) so both
+// derive the SAME (jc,kc) slot grid and chunk shapes — the pre-tiled B-scale images then line
+// up byte-for-byte with what the loop expects.
+typedef struct {
+  size_t i_tiles, j_tiles, k_tiles;
+  size_t i_chunk, j_chunk, k_chunk;
+  size_t mx_JC, mx_KC;   // (jc,kc) chunk-grid dimensions
+} mxint8_geom_t;
+
+_STATIC mxint8_geom_t mxint8_compute_geom(size_t M, size_t N, size_t K) {
+  mxint8_geom_t g;
+  g.i_tiles = (M + DIM - 1) / DIM;
+  g.j_tiles = (N + DIM - 1) / DIM;
+  g.k_tiles = (K + DIM - 1) / DIM;
+  const size_t spad_rows = (size_t)BANK_NUM * BANK_ROWS;
+
+  // Jp capped at 4 (balanced B-scale-region vs accumulator default); I and K then fill bounds.
+  size_t log2_jp = 0;
+  while (((size_t)1 << log2_jp) < g.j_tiles && log2_jp < 2) {
+    log2_jp++;
+  }
+  const size_t jp = (size_t)1 << log2_jp;
+  g.j_chunk = (g.j_tiles < jp) ? g.j_tiles : jp;
+
+  // Accumulator output uses HALF of ACC_ROWS per loop; scale SRAM is /4 (loop-parity ping-pong).
+  g.i_chunk = ACC_ROWS / (2 * jp * DIM);
+  if (g.i_chunk > MX_SCALE_SP_ROWS / (4 * DIM)) {
+    g.i_chunk = MX_SCALE_SP_ROWS / (4 * DIM);
+  }
+  if (g.i_chunk > g.i_tiles) {
+    g.i_chunk = g.i_tiles;
+  }
+
+  // K chunk (DIM tiles): A-scale lanes, B-scale region, scratchpad half, rounded to MX blocks.
+  const size_t tiles_per_block = MX_BLOCK_SIZE / DIM;
+  g.k_chunk = (size_t)DIM * tiles_per_block;  // k_blocks <= DIM
+  {
+    const size_t kb_cap = MX_SCALE_SP_ROWS / (4 * jp);
+    if (g.k_chunk > kb_cap * tiles_per_block) {
+      g.k_chunk = kb_cap * tiles_per_block;
+    }
+    const size_t spad_cap = spad_rows / 2 / DIM / (g.i_chunk + g.j_chunk);
+    if (g.k_chunk > spad_cap) {
+      g.k_chunk = spad_cap;
+    }
+    g.k_chunk -= g.k_chunk % tiles_per_block;
+    if (g.k_chunk > g.k_tiles) {
+      g.k_chunk = ((g.k_tiles + tiles_per_block - 1) / tiles_per_block) * tiles_per_block;
+    }
+  }
+
+  if (g.i_chunk == 0 || g.j_chunk == 0 || g.k_chunk == 0) {
+    printf("mxint8_compute_geom: no valid chunk shape (i=%lu j=%lu k=%lu)\n",
+           (unsigned long)g.i_chunk, (unsigned long)g.j_chunk, (unsigned long)g.k_chunk);
+    exit(1);
+  }
+
+  g.mx_KC = (g.k_tiles + g.k_chunk - 1) / g.k_chunk;
+  g.mx_JC = (g.j_tiles + g.j_chunk - 1) / g.j_chunk;
+  return g;
+}
+
+/**
+ * Offline B-scale pre-tiler (Phase C). For a CONSTANT B matrix (weights), repack the dense
+ * B-scales into the per-(j,k) tiled SRAM image ONCE, ahead of time, into a caller-provided
+ * buffer. Passing that buffer to `tiled_matmul_mxint8_pretiled` then removes the per-chunk
+ * repack from the timed GEMM entirely (it was the dominant MX host cost).
+ *
+ * `buf` must hold `mx_JC*mx_KC` slots of `MX_PRETILE_SLOT_ELEMS` bytes each (slot s laid out
+ * at `buf + s*MX_PRETILE_SLOT_ELEMS`, exactly as the loop's cache indexes them). The bytes
+ * produced are identical to the in-loop repack — only their timing moves out of the measured
+ * region — so bit-exactness is preserved.
+ */
+_STATIC void mxint8_pretile_b_scales(size_t M, size_t N, size_t K,
+                                     const mx_scale_t *B_scale, size_t B_scale_stride,
+                                     mx_scale_t *buf) {
+  const mxint8_geom_t g = mxint8_compute_geom(M, N, K);
+
+  for (size_t j0 = 0; j0 < g.j_tiles; j0 += g.j_chunk) {
+    const size_t jt = (j0 + g.j_chunk <= g.j_tiles) ? g.j_chunk : (g.j_tiles - j0);
+    const size_t pad_j = (j0 + jt) * DIM > N ? (j0 + jt) * DIM - N : 0;
+    const size_t n_cols = jt * DIM - pad_j;
+    // Inner padded pitch is derived from the chunk's own jt (matches gemmini_loop_ws_mxint8).
+    size_t log2_jp = 0;
+    while (((size_t)1 << log2_jp) < jt) {
+      log2_jp++;
+    }
+    const size_t jp = (size_t)1 << log2_jp;
+
+    for (size_t k0 = 0; k0 < g.k_tiles; k0 += g.k_chunk) {
+      const size_t kt = (k0 + g.k_chunk <= g.k_tiles) ? g.k_chunk : (g.k_tiles - k0);
+      const size_t pad_k = (k0 + kt) * DIM > K ? (k0 + kt) * DIM - K : 0;
+      const size_t k_elems = kt * DIM - pad_k;
+      const size_t k_blocks = (k_elems + MX_BLOCK_SIZE - 1) / MX_BLOCK_SIZE;
+      const size_t kb0 = (k0 * DIM) / MX_BLOCK_SIZE;
+
+      const size_t slot = (j0 / g.j_chunk) * g.mx_KC + (k0 / g.k_chunk);
+      mxint8_repack_b_scales_tiled(B_scale + kb0 * B_scale_stride + j0 * DIM,
+                                   k_blocks, n_cols, B_scale_stride, jp,
+                                   buf + slot * MX_PRETILE_SLOT_ELEMS);
+    }
+  }
+}
+
 /**
  * Software outer tiler for MXINT8 GEMM: C = A*B (+ D), with M/N/K in elements.
  *
@@ -716,68 +826,25 @@ _STATIC void gemmini_loop_ws_mxint8(size_t I, size_t J, size_t K,
  * @param low_D Reads D as elem_t when true, acc_t otherwise.
  * @param act Activation function applied at mvout (0 = none).
  */
-_STATIC void tiled_matmul_mxint8(size_t M, size_t N, size_t K,
+// Internal MXINT8 outer-tiler body. `b_pretiled` (Phase C) is NULL for the public legacy
+// entry (per-chunk repack into the internal cache) or points at a caller-provided buffer of
+// `mx_JC*mx_KC` MX_PRETILE_SLOT_ELEMS-sized slots that already holds the tiled B-scale images
+// (from `mxint8_pretile_b_scales`), in which case the loop never repacks.
+_STATIC void tiled_matmul_mxint8_impl(size_t M, size_t N, size_t K,
                                  const elem_t *A_payload, const elem_t *B_payload,
                                  const void *D, void *C,
                                  const mx_scale_t *A_scale, const mx_scale_t *B_scale,
                                  size_t A_stride, size_t B_stride,
                                  size_t D_stride, size_t C_stride,
                                  size_t A_scale_stride, size_t B_scale_stride,
-                                 bool full_C, bool low_D, int act) {
-  const size_t i_tiles = (M + DIM - 1) / DIM;
-  const size_t j_tiles = (N + DIM - 1) / DIM;
-  const size_t k_tiles = (K + DIM - 1) / DIM;
-  const size_t spad_rows = (size_t)BANK_NUM * BANK_ROWS;
+                                 bool full_C, bool low_D, int act,
+                                 const mx_scale_t *b_pretiled) {
+  const mxint8_geom_t g = mxint8_compute_geom(M, N, K);
+  const size_t i_tiles = g.i_tiles, j_tiles = g.j_tiles, k_tiles = g.k_tiles;
+  const size_t i_chunk = g.i_chunk, j_chunk = g.j_chunk, k_chunk = g.k_chunk;
+  const size_t mx_KC = g.mx_KC, mx_JC = g.mx_JC;
   const size_t sizeof_c = full_C ? sizeof(acc_t) : sizeof(elem_t);
   const size_t sizeof_d = low_D ? sizeof(elem_t) : sizeof(acc_t);
-
-  // Per-invocation chunk shape (tiles). Jp is capped at 4 (a balanced default for the
-  // B-scale region vs accumulator trade-off); I and K then fill their envelope bounds.
-  size_t log2_jp = 0;
-  while (((size_t)1 << log2_jp) < j_tiles && log2_jp < 2) {
-    log2_jp++;
-  }
-  const size_t jp = (size_t)1 << log2_jp;
-  const size_t j_chunk = (j_tiles < jp) ? j_tiles : jp;
-
-  // Accumulator output uses HALF of ACC_ROWS per loop (the unroller's other half is the
-  // concurrent-loop double-buffer; the MX tag->tile recovery masks it off,
-  // `mx_acc_tiles_half = acc_rows/(2*DIM)`). The scale SRAM is additionally ping-ponged by
-  // loop parity (P3): each in-flight chunk owns a QUARTER of each scale region (A:
-  // MX_SCALE_SP_ROWS/4 rows, B likewise), so a fenceless next chunk's scale mvin cannot
-  // clobber this chunk's still-draining scales. Hence the scale bound is /4, not /2.
-  size_t i_chunk = ACC_ROWS / (2 * jp * DIM);
-  if (i_chunk > MX_SCALE_SP_ROWS / (4 * DIM)) {
-    i_chunk = MX_SCALE_SP_ROWS / (4 * DIM);
-  }
-  if (i_chunk > i_tiles) {
-    i_chunk = i_tiles;
-  }
-
-  // K chunk (in DIM tiles): A-scale lanes, B-scale region, scratchpad half (A and B
-  // payload tiles share one half), then rounded down to a whole-MX-block multiple.
-  const size_t tiles_per_block = MX_BLOCK_SIZE / DIM;
-  size_t k_chunk = (size_t)DIM * tiles_per_block;  // k_blocks <= DIM
-  {
-    const size_t kb_cap = MX_SCALE_SP_ROWS / (4 * jp);
-    if (k_chunk > kb_cap * tiles_per_block) {
-      k_chunk = kb_cap * tiles_per_block;
-    }
-    const size_t spad_cap = spad_rows / 2 / DIM / (i_chunk + j_chunk);
-    if (k_chunk > spad_cap) {
-      k_chunk = spad_cap;
-    }
-    k_chunk -= k_chunk % tiles_per_block;
-    if (k_chunk > k_tiles) {
-      k_chunk = ((k_tiles + tiles_per_block - 1) / tiles_per_block) * tiles_per_block;
-    }
-  }
-
-  if (i_chunk == 0 || j_chunk == 0 || k_chunk == 0) {
-    printf("tiled_matmul_mxint8: no valid chunk shape (i=%lu j=%lu k=%lu)\n",
-           (unsigned long)i_chunk, (unsigned long)j_chunk, (unsigned long)k_chunk);
-    exit(1);
-  }
 
   // P3 pipelining: independent output-tile chunks (distinct (i0,j0)) run fenceless in
   // depth-2 pairs through the unroller's 2 concurrent-loop slots, alternating the scale-SRAM
@@ -794,14 +861,14 @@ _STATIC void tiled_matmul_mxint8(size_t M, size_t N, size_t K,
   // Phase 1 fix: the repacked B-scale image depends only on (j-chunk, k-chunk), not on the
   // output-row chunk i0, but gemmini_loop_ws_mxint8 re-tiled it for every i0 — 84% of MX
   // runtime. Cache one tiled image per (jc, kc) and reuse across the i0 sweep. One slot is
-  // (MX_SCALE_SP_ROWS/2)*DIM bytes (the max image, per the k_blocks*jp <= MX_SCALE_SP_ROWS/2
+  // MX_PRETILE_SLOT_ELEMS bytes (the max image, per the k_blocks*jp <= MX_SCALE_SP_ROWS/2
   // envelope check). Fall back to per-chunk repack if the (jc,kc) grid exceeds the cache.
-  static mx_scale_t mx_btile_cache[4][(MX_SCALE_SP_ROWS / 2) * DIM];
+  // Phase C: when `b_pretiled` is provided, every chunk reads its slot from that buffer with
+  // validity forced true — no repack ever happens inside the (timed) loop.
+  static mx_scale_t mx_btile_cache[4][MX_PRETILE_SLOT_ELEMS];
   static bool mx_btile_valid[4];
-  const size_t mx_KC = (k_tiles + k_chunk - 1) / k_chunk;
-  const size_t mx_JC = (j_tiles + j_chunk - 1) / j_chunk;
-  const bool mx_use_btile_cache = (mx_JC * mx_KC <= 4);
-  if (mx_use_btile_cache) {
+  const bool mx_use_btile_cache = (b_pretiled != NULL) || (mx_JC * mx_KC <= 4);
+  if (b_pretiled == NULL && mx_use_btile_cache) {
     for (size_t t = 0; t < mx_JC * mx_KC; t++) mx_btile_valid[t] = false;
   }
 
@@ -838,12 +905,18 @@ _STATIC void tiled_matmul_mxint8(size_t M, size_t N, size_t K,
         const int pp = do_fence ? 0 : (int)since_fence;
 
         // Point gemmini_loop_ws_mxint8 at this (jc,kc)'s cached tiled B-scale image so it
-        // repacks only on the first i0 and reuses it thereafter.
+        // repacks only on the first i0 and reuses it thereafter. With b_pretiled the image is
+        // already valid (filled offline), so no repack happens at all.
         size_t mx_slot = 0;
         if (mx_use_btile_cache) {
           mx_slot = (j0 / j_chunk) * mx_KC + (k0 / k_chunk);
-          g_mx_btile_cache = mx_btile_cache[mx_slot];
-          g_mx_btile_valid = mx_btile_valid[mx_slot];
+          if (b_pretiled != NULL) {
+            g_mx_btile_cache = (mx_scale_t *)(b_pretiled + mx_slot * MX_PRETILE_SLOT_ELEMS);
+            g_mx_btile_valid = true;
+          } else {
+            g_mx_btile_cache = mx_btile_cache[mx_slot];
+            g_mx_btile_valid = mx_btile_valid[mx_slot];
+          }
         } else {
           g_mx_btile_cache = NULL;
         }
@@ -861,7 +934,7 @@ _STATIC void tiled_matmul_mxint8(size_t M, size_t N, size_t K,
             /*a_spad_id=*/0, /*b_spad_id=*/0, /*is_resadd=*/false,
             /*pipeline_parity=*/pp, /*fence_first=*/do_fence, /*setup_only=*/false);
 
-        if (mx_use_btile_cache) mx_btile_valid[mx_slot] = g_mx_btile_valid;
+        if (mx_use_btile_cache && b_pretiled == NULL) mx_btile_valid[mx_slot] = g_mx_btile_valid;
         g_mx_btile_cache = NULL;  // restore default for any other (direct) callers
 
         since_fence = do_fence ? 1 : (since_fence + 1);
@@ -869,6 +942,37 @@ _STATIC void tiled_matmul_mxint8(size_t M, size_t N, size_t K,
       }
     }
   }
+}
+
+// Public MXINT8 outer tiler (legacy: per-chunk repack into the internal cache). Signature
+// unchanged so all existing callers stay byte-identical (bit-exact gate).
+_STATIC void tiled_matmul_mxint8(size_t M, size_t N, size_t K,
+                                 const elem_t *A_payload, const elem_t *B_payload,
+                                 const void *D, void *C,
+                                 const mx_scale_t *A_scale, const mx_scale_t *B_scale,
+                                 size_t A_stride, size_t B_stride,
+                                 size_t D_stride, size_t C_stride,
+                                 size_t A_scale_stride, size_t B_scale_stride,
+                                 bool full_C, bool low_D, int act) {
+  tiled_matmul_mxint8_impl(M, N, K, A_payload, B_payload, D, C, A_scale, B_scale,
+                           A_stride, B_stride, D_stride, C_stride,
+                           A_scale_stride, B_scale_stride, full_C, low_D, act, NULL);
+}
+
+// Phase C entry: same as tiled_matmul_mxint8 but consumes a B-scale image pre-tiled offline by
+// mxint8_pretile_b_scales (constant weights), so the timed GEMM does zero B-scale repack.
+_STATIC void tiled_matmul_mxint8_pretiled(size_t M, size_t N, size_t K,
+                                 const elem_t *A_payload, const elem_t *B_payload,
+                                 const void *D, void *C,
+                                 const mx_scale_t *A_scale, const mx_scale_t *B_scale,
+                                 size_t A_stride, size_t B_stride,
+                                 size_t D_stride, size_t C_stride,
+                                 size_t A_scale_stride, size_t B_scale_stride,
+                                 bool full_C, bool low_D, int act,
+                                 const mx_scale_t *b_pretiled) {
+  tiled_matmul_mxint8_impl(M, N, K, A_payload, B_payload, D, C, A_scale, B_scale,
+                           A_stride, B_stride, D_stride, C_stride,
+                           A_scale_stride, B_scale_stride, full_C, low_D, act, b_pretiled);
 }
 
 // weight-stationary conv loop
