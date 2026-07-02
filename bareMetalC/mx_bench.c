@@ -204,36 +204,47 @@ static int run_shape(const bench_shape_t *s) {
   // load_active/load_dma_wait = payload load controller; rdma_active = read DMA engine; tlb_miss
   // = TLB thrash; scale_dma = scale-mvin DMA. Compared against mesh-busy (matmul_in_progress)
   // and unroller-configured (loopmm). All are stock counters (valid in both sims), no rebuild.
-  counter_configure(0, MX_DBG_NO_CMD_CYCLE);                // EX controller starved (denominator)
-  counter_configure(1, MX_DBG_MATMUL_IN_PROGRESS_CYCLE);    // mesh busy (reference)
-  counter_configure(2, LOAD_ACTIVE_CYCLE);                  // payload load DMA active
-  counter_configure(3, LOAD_DMA_WAIT_CYCLE);                // load controller waiting on DMA
-  counter_configure(4, RDMA_ACTIVE_CYCLE);                  // read-DMA engine active
-  counter_configure(5, DMA_TLB_MISS_CYCLE);                 // TLB miss stalls
-  counter_configure(6, MX_SCALE_DMA_ACTIVE_CYCLE);          // scale-mvin DMA active
-  counter_configure(7, LOOP_MATMUL_ACTIVE_CYCLES);          // unroller configured (reference)
-  counter_reset();
+  // Step-1/3 feed-bubble partition (Phase C regime): a loop is *configured* ~87% of the timed
+  // region (loopmm_active) yet the mesh is fed only ~49% (matmul_in_progress) at 256³ — so on
+  // top of the host-issue gap there is an INTRA-loop mesh-feed bubble. These 8 slots localize
+  // it. spadA_wait/spadB_wait = the controller wants to feed A/B but the scratchpad read resp
+  // isn't valid (the pre-Phase-C dominant stall — re-measure post-repack). overlap_haz = the
+  // mesh can't start the next matmul until the previous output drained (drain serialization).
+  // preload_haz = preload RAW. no_cmd = EX starved (now reset *after* the untimed pretile, so
+  // it no longer counts the host pretile window). matmul_in_progress / loopmm_active = mesh-busy
+  // and unroller-configured references. All events already wired in the RTL (no sim rebuild).
+  counter_configure(0, MX_DBG_MATMUL_IN_PROGRESS_CYCLE);    // mesh busy (reference)
+  counter_configure(1, LOOP_MATMUL_ACTIVE_CYCLES);          // unroller configured (reference)
+  counter_configure(2, SCRATCHPAD_A_WAIT_CYCLE);            // A feed: ctrl wants A, spad not ready
+  counter_configure(3, SCRATCHPAD_B_WAIT_CYCLE);            // B feed: ctrl wants B, spad not ready
+  counter_configure(4, EXE_OVERLAP_HAZ_CYCLE);              // next matmul blocked on prior drain
+  counter_configure(5, EXE_PRELOAD_HAZ_CYCLE);              // preload RAW hazard
+  counter_configure(6, MX_DBG_NO_CMD_CYCLE);                // EX controller starved
+  counter_configure(7, RDMA_ACTIVE_CYCLE);                  // read-DMA engine active (reference)
 #if MX_ENABLED
   g_mx_repack_cyc = 0; g_mx_issue_cyc = 0;  // Phase-0c CPU-cost localization
+  g_mx_fence_cyc = 0; g_mx_config_cyc = 0; g_mx_scalea_cyc = 0; g_mx_scaleb_cyc = 0;
   // Phase C: pre-tile the constant B-scales ONCE here (untimed). This calls the repack
   // directly (not the timed wrapper), so g_mx_repack_cyc stays 0; the timed GEMM below reads
   // b_pretiled and never repacks. Bytes are identical to the in-loop repack -> bit-exact.
   mxint8_pretile_b_scales(s->m, s->n, s->k, &b_scale[0][0], N_MAX, b_pretiled);
 #endif
   printf("TRACE,pre_run_gemm,M=%lu\n", (unsigned long)s->m);
+  // Reset AFTER the untimed pretile so every counter aligns to the timed GEMM window.
+  counter_reset();
   const uint64_t start = read_cycles();
   run_gemm(s->m, s->n, s->k);
   const uint64_t end = read_cycles();
   printf("TRACE,post_run_gemm,M=%lu\n", (unsigned long)s->m);
   gemmini_fence();
-  const uint32_t c_no_cmd     = counter_read(0);  // NO_CMD
-  const uint32_t c_mm_prog    = counter_read(1);  // MATMUL_IN_PROGRESS
-  const uint32_t c_ld_active  = counter_read(2);  // LOAD_ACTIVE
-  const uint32_t c_ld_wait    = counter_read(3);  // LOAD_DMA_WAIT
-  const uint32_t c_rdma       = counter_read(4);  // RDMA_ACTIVE
-  const uint32_t c_tlb_miss   = counter_read(5);  // DMA_TLB_MISS
-  const uint32_t c_scale_dma  = counter_read(6);  // MX_SCALE_DMA_ACTIVE
-  const uint32_t c_loopmm     = counter_read(7);  // LOOP_MATMUL_ACTIVE
+  const uint32_t c_mm_prog    = counter_read(0);  // MATMUL_IN_PROGRESS
+  const uint32_t c_loopmm     = counter_read(1);  // LOOP_MATMUL_ACTIVE
+  const uint32_t c_spadA_wait = counter_read(2);  // SCRATCHPAD_A_WAIT
+  const uint32_t c_spadB_wait = counter_read(3);  // SCRATCHPAD_B_WAIT
+  const uint32_t c_overlap    = counter_read(4);  // EXE_OVERLAP_HAZ
+  const uint32_t c_preload    = counter_read(5);  // EXE_PRELOAD_HAZ
+  const uint32_t c_no_cmd     = counter_read(6);  // NO_CMD
+  const uint32_t c_rdma       = counter_read(7);  // RDMA_ACTIVE
 
   int bad = 0;
   for (int r = 0; r < GOLDEN_ROWS; r++) {
@@ -256,22 +267,25 @@ static int run_shape(const bench_shape_t *s) {
          (unsigned long long)cycles, (unsigned long long)macs,
          (unsigned long long)ideal, (unsigned long long)util_pct,
          bad ? "FAIL" : "PASS");
-  printf("MXCOUNT,impl=%s,dim=%d,M=%lu,N=%lu,K=%lu,cycles=%llu,no_cmd=%u,"
-         "matmul_in_progress=%u,load_active=%u,load_dma_wait=%u,rdma_active=%u,"
-         "tlb_miss=%u,scale_dma=%u,loopmm_active=%u\n",
+  printf("MXCOUNT,impl=%s,dim=%d,M=%lu,N=%lu,K=%lu,cycles=%llu,matmul_in_progress=%u,"
+         "loopmm_active=%u,spadA_wait=%u,spadB_wait=%u,overlap_haz=%u,preload_haz=%u,"
+         "no_cmd=%u,rdma_active=%u\n",
 #if MX_ENABLED
          "mx",
 #else
          "stock",
 #endif
          DIM, (unsigned long)s->m, (unsigned long)s->n, (unsigned long)s->k,
-         (unsigned long long)cycles, c_no_cmd, c_mm_prog, c_ld_active, c_ld_wait,
-         c_rdma, c_tlb_miss, c_scale_dma, c_loopmm);
+         (unsigned long long)cycles, c_mm_prog, c_loopmm, c_spadA_wait, c_spadB_wait,
+         c_overlap, c_preload, c_no_cmd, c_rdma);
 #if MX_ENABLED
-  printf("MXCPU,impl=mx,dim=%d,M=%lu,N=%lu,K=%lu,cycles=%llu,repack_cyc=%llu,issue_cyc=%llu\n",
+  printf("MXCPU,impl=mx,dim=%d,M=%lu,N=%lu,K=%lu,cycles=%llu,repack_cyc=%llu,issue_cyc=%llu,"
+         "fence_cyc=%llu,config_cyc=%llu,scalea_cyc=%llu,scaleb_cyc=%llu\n",
          DIM, (unsigned long)s->m, (unsigned long)s->n, (unsigned long)s->k,
          (unsigned long long)cycles, (unsigned long long)g_mx_repack_cyc,
-         (unsigned long long)g_mx_issue_cyc);
+         (unsigned long long)g_mx_issue_cyc, (unsigned long long)g_mx_fence_cyc,
+         (unsigned long long)g_mx_config_cyc, (unsigned long long)g_mx_scalea_cyc,
+         (unsigned long long)g_mx_scaleb_cyc);
 #endif
   return bad;
 }

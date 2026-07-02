@@ -527,6 +527,14 @@ _STATIC void mxint8_repack_b_scales_tiled(const mx_scale_t *b_scale,
 // attribute the ~85% accelerator-idle (CPU-bound) time. Read/reset by mx_bench.
 static uint64_t g_mx_repack_cyc = 0;
 static uint64_t g_mx_issue_cyc = 0;
+// Fine-grained per-chunk host-cost partition (observation-only): where do the per-chunk MX host
+// cycles go? fence = gemmini_fence() drain wait; config = CONFIG_MXINT8 issue; scalea/scaleb =
+// the scale-mvin ROCC issue. issue_cyc already isolates gemmini_loop_ws_mx. Sum tells us whether
+// the residual is a drain-fence stall, scale-mvin issue backpressure, or the loop_ws emission.
+static uint64_t g_mx_fence_cyc = 0;
+static uint64_t g_mx_config_cyc = 0;
+static uint64_t g_mx_scalea_cyc = 0;
+static uint64_t g_mx_scaleb_cyc = 0;
 static inline uint64_t mx_rdcycle_(void) { uint64_t c; __asm__ volatile ("rdcycle %0" : "=r"(c)); return c; }
 
 // B-scale tiling reuse (Phase 1 fix). The repacked B-scale image depends only on the
@@ -651,18 +659,25 @@ _STATIC void gemmini_loop_ws_mxint8(size_t I, size_t J, size_t K,
   // self-cycles via k_blocks and each chunk owns a scale-SRAM ping-pong half, so consecutive
   // chunks pipeline; the caller fences only on parity reuse / geometry change (fence_first).
   if (fence_first) {
+    const uint64_t _fn0 = mx_rdcycle_();
     gemmini_fence();
+    g_mx_fence_cyc += mx_rdcycle_() - _fn0;
   }
 
+  const uint64_t _cf0 = mx_rdcycle_();
   gemmini_config_mxint8_tiled(true, 0, I, J, log2_jp,
                               (pipeline_parity >= 0) ? k_blocks : (size_t)0,
                               /*reset_k=*/fence_first);
+  g_mx_config_cyc += mx_rdcycle_() - _cf0;
+  const uint64_t _sa0 = mx_rdcycle_();
   gemmini_mvin_mxscale_a(A_scale, mxint8_pp_off, m_rows, k_blocks, A_scale_stride);
+  g_mx_scalea_cyc += mx_rdcycle_() - _sa0;
 
   // B scales: load the padded tiled image (one SRAM row per (kb, tile_j) pair) into this
   // chunk's ping-pong half. When the dense host layout already is that image (full tiles,
   // dense stride, power-of-two J), load it directly; otherwise repack on the host first.
   const size_t b_scale_addr = MX_SCALE_SP_ROWS / 2 + mxint8_pp_off;
+  const uint64_t _sb0 = mx_rdcycle_();
   if (n_cols == jp * DIM && B_scale_stride == n_cols) {
     gemmini_mvin_mxscale_b(B_scale, b_scale_addr, k_blocks * jp, DIM, DIM);
   } else {
@@ -678,6 +693,7 @@ _STATIC void gemmini_loop_ws_mxint8(size_t I, size_t J, size_t K,
     }
     gemmini_mvin_mxscale_b(btile, b_scale_addr, k_blocks * jp, DIM, DIM);
   }
+  g_mx_scaleb_cyc += mx_rdcycle_() - _sb0;  // pure mvin issue (repack skipped on the pretiled path)
 
   if (!setup_only) {
     const uint64_t _is0 = mx_rdcycle_();
@@ -846,16 +862,21 @@ _STATIC void tiled_matmul_mxint8_impl(size_t M, size_t N, size_t K,
   const size_t sizeof_c = full_C ? sizeof(acc_t) : sizeof(elem_t);
   const size_t sizeof_d = low_D ? sizeof(elem_t) : sizeof(acc_t);
 
-  // P3 pipelining: independent output-tile chunks (distinct (i0,j0)) run fenceless in
-  // depth-2 pairs through the unroller's 2 concurrent-loop slots, alternating the scale-SRAM
-  // ping-pong half by `pp` (0/1). A fence (+ RESET_K, which lands the walk back on parity 0)
-  // is inserted only when needed: the first chunk, every 3rd chunk (parity-0 reuse beyond
-  // the 2-deep window), a geometry change (the per-loop config reg is global, so two paired
-  // chunks must share it_/jt_/kt_), or any K-chunked problem (K-continuation chunks accumulate
-  // into the same tile and are inherently serial). `pp` mirrors the hardware walk parity,
-  // which RESET_K zeroes and the kb-wrap toggles once per chunk, so the two stay in lockstep.
+  // Pipelining (P3 + HW scale-half interlock): independent output-tile chunks (distinct (i0,j0))
+  // run FENCELESS, alternating the scale-SRAM ping-pong half by `pp` (0/1/0/1...). `pp` mirrors
+  // the hardware walk parity, which RESET_K zeroes and the kb-wrap toggles once per chunk, so
+  // the two stay in lockstep. The per-chunk gemmini_fence() (previously inserted every other
+  // chunk to stop chunk C+2 from clobbering chunk C's still-reading half — 42% of 256^3
+  // runtime) is GONE: the MXScaleLoadController now holds chunk C+2's A-scale-mvin in hardware
+  // until chunk C drains and frees the half (credit interlock, ExecuteController.loop_drained),
+  // so consecutive chunks pipeline and the mesh stays fed while a half is reused. A fence
+  // (+ RESET_K, which lands the walk back on parity 0) is still inserted only for real
+  // serialization: the first chunk, a geometry change (the per-loop config reg is global, so
+  // adjacent fenceless chunks must share it_/jt_/kt_), or any K-chunked problem (K-continuation
+  // chunks accumulate into the same tile and are inherently serial).
   const bool k_chunked = (k_chunk < k_tiles);
-  size_t since_fence = 2;          // forces a fence (new pair) before the very first chunk
+  bool first_chunk = true;         // the very first chunk fences (+ RESET_K) to zero the walk
+  size_t since_fence = 0;          // chunks issued since the last fence; drives the parity toggle
   size_t prev_it = 0, prev_jt = 0, prev_kt = 0;
 
   // Phase 1 fix: the repacked B-scale image depends only on (j-chunk, k-chunk), not on the
@@ -901,8 +922,11 @@ _STATIC void tiled_matmul_mxint8_impl(size_t M, size_t N, size_t K,
         // and spad_id 1/2 only added load traffic. So pairing stays per-chunk; see
         // PERF_ANALYSIS.md "deferred pairing".)
         const bool geom_same = (it == prev_it && jt == prev_jt && kt == prev_kt);
-        const bool do_fence = k_chunked || (since_fence >= 2) || !geom_same;
-        const int pp = do_fence ? 0 : (int)since_fence;
+        const bool do_fence = k_chunked || first_chunk || !geom_same;
+        // Continuous ping-pong parity: 0 on a fenced (walk-reset) chunk, then alternating
+        // 1,0,1,0... for the fenceless run. The HW credit interlock (2 halves) throttles a
+        // reused half, so no fence is needed to bound the pipeline depth.
+        const int pp = do_fence ? 0 : (int)(since_fence % 2);
 
         // Point gemmini_loop_ws_mxint8 at this (jc,kc)'s cached tiled B-scale image so it
         // repacks only on the first i0 and reuses it thereafter. With b_pretiled the image is
@@ -938,6 +962,7 @@ _STATIC void tiled_matmul_mxint8_impl(size_t M, size_t N, size_t K,
         g_mx_btile_cache = NULL;  // restore default for any other (direct) callers
 
         since_fence = do_fence ? 1 : (since_fence + 1);
+        first_chunk = false;
         prev_it = it; prev_jt = jt; prev_kt = kt;
       }
     }
