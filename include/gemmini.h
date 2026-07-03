@@ -893,6 +893,18 @@ _STATIC void tiled_matmul_mxint8_impl(size_t M, size_t N, size_t K,
     for (size_t t = 0; t < mx_JC * mx_KC; t++) mx_btile_valid[t] = false;
   }
 
+  // Payload-operand reuse (mirrors stock tiled_matmul_outer): when all B chunks fit the two
+  // scratchpad ping-pong regions (mx_JC*mx_KC <= 2), load B once at i0==0 and REUSE it across
+  // the i-sweep (b_spad_id selects the resident region, B_payload=NULL skips the re-mvin);
+  // likewise A across the j-sweep when all A chunks fit. Without this the MX tiler re-fetched B
+  // for every i-chunk -> 2x the read-DMA bytes of stock, starving the mesh feed (measured). The
+  // scale sidecar (per-chunk scale-mvins, ping-pong parity, B-scale cache) is orthogonal and
+  // unchanged. spad_id 0 = no reuse (byte-identical to the prior behavior -> bit-exact when the
+  // condition is false).
+  const size_t mx_IC = (i_tiles + i_chunk - 1) / i_chunk;
+  const bool mx_b_reuse = (mx_JC * mx_KC <= 2);
+  const bool mx_a_reuse = (mx_IC * mx_KC <= 2);
+
   for (size_t i0 = 0; i0 < i_tiles; i0 += i_chunk) {
     const size_t it = (i0 + i_chunk <= i_tiles) ? i_chunk : (i_tiles - i0);
     const size_t pad_i = (i0 + it) * DIM > M ? (i0 + it) * DIM - M : 0;
@@ -945,9 +957,22 @@ _STATIC void tiled_matmul_mxint8_impl(size_t M, size_t N, size_t K,
           g_mx_btile_cache = NULL;
         }
 
+        // Operand reuse (chunk indices). a_spad_id/b_spad_id pick the resident scratchpad region
+        // (1/2); passing a NULL payload skips its re-mvin so the resident tile is reused. A is
+        // reused across the j-sweep (loaded per (ic,kc)), B across the i-sweep (loaded per
+        // (jc,kc)). When a chunk is the operand's first use, the payload pointer stays non-NULL
+        // (it must be loaded); NULL only on a genuine reuse iteration.
+        const size_t mx_ic = i0 / i_chunk, mx_jc = j0 / j_chunk, mx_kc = k0 / k_chunk;
+        const int a_sid = mx_a_reuse ? (((mx_ic + mx_kc) == 0) ? 1 : 2) : 0;
+        const int b_sid = mx_b_reuse ? (((mx_jc + mx_kc) == 0) ? 1 : 2) : 0;
+        const elem_t *a_ptr = A_payload + i0 * DIM * A_stride + k0 * DIM;
+        const elem_t *b_ptr = B_payload + k0 * DIM * B_stride + j0 * DIM;
+        if (mx_a_reuse && mx_jc >= 1) a_ptr = NULL;  // A(ic,kc) already resident from jc==0
+        if (mx_b_reuse && mx_ic >= 1) b_ptr = NULL;  // B(jc,kc) already resident from ic==0
+
         gemmini_loop_ws_mxint8(it, jt, kt, pad_i, pad_j, pad_k,
-            A_payload + i0 * DIM * A_stride + k0 * DIM,
-            B_payload + k0 * DIM * B_stride + j0 * DIM,
+            a_ptr,
+            b_ptr,
             d_chunk, c_chunk,
             A_scale + i0 * DIM * A_scale_stride + kb0,
             B_scale + kb0 * B_scale_stride + j0 * DIM,
@@ -955,7 +980,7 @@ _STATIC void tiled_matmul_mxint8_impl(size_t M, size_t N, size_t K,
             A_scale_stride, B_scale_stride,
             false, false, full_C, low_D,
             /*ex_accumulate=*/!first_k, act,
-            /*a_spad_id=*/0, /*b_spad_id=*/0, /*is_resadd=*/false,
+            /*a_spad_id=*/a_sid, /*b_spad_id=*/b_sid, /*is_resadd=*/false,
             /*pipeline_parity=*/pp, /*fence_first=*/do_fence, /*setup_only=*/false);
 
         if (mx_use_btile_cache && b_pretiled == NULL) mx_btile_valid[mx_slot] = g_mx_btile_valid;
