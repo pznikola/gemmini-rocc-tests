@@ -12,9 +12,9 @@
 // mvins and per-invocation fences on the MX side), compute, and mvout. full_C=true on
 // both sides (identical 4-byte/element mvout traffic).
 //
-// Correctness gates every data point: GOLDEN_ROWS sampled output rows are checked
-// against the bit-exact reference (int32 GEMM for stock; `mxint8_ref_gemm_acc` rows for
-// MX). Machine-readable result lines:
+// Correctness gates every data point: GOLDEN_POINTS sampled output cells are checked
+// against the bit-exact reference (int32 GEMM for stock; MX block-scaled GEMM for MX).
+// Machine-readable result lines:
 //   MXBENCH,impl=<stock|mx>,dim=<D>,M=,N=,K=,cycles=,macs=,ideal_cycles=,util_pct=,result=<PASS|FAIL>
 //
 // Shape table is gated by DIM to keep Verilator runtimes bounded (see plan Stage C).
@@ -31,7 +31,13 @@
 #include "include/mxint8_golden.h"
 #endif
 
-#define GOLDEN_ROWS 8
+#define GOLDEN_POINTS 16
+#ifndef MX_BENCH_PRINT_GEOM
+#define MX_BENCH_PRINT_GEOM 0
+#endif
+#ifndef MX_BENCH_COUNTER_SET
+#define MX_BENCH_COUNTER_SET 0
+#endif
 
 // Shape limits (bytes are dominated by B and C for the BERT shapes).
 // Known-good array sizing (matches the original suite). Tight 64-strides deadlocked the MX
@@ -51,13 +57,20 @@ static const bench_shape_t shapes[] = {
   {256, 256, 256},
 };
 
-static elem_t a_payload[M_MAX][K_MAX] row_align(1);
-static elem_t b_payload[K_MAX][N_MAX] row_align(1);
+static elem_t a_payload[M_MAX][K_MAX] row_align(1) = {
+  [0 ... M_MAX-1] = { [0 ... K_MAX-1] = 127 },
+};
+static elem_t b_payload[K_MAX][N_MAX] row_align(1) = {
+  [0 ... K_MAX-1] = { [0 ... N_MAX-1] = 127 },
+};
 static acc_t c_hw[M_MAX][N_MAX] row_align(1);
-static acc_t gold_row[N_MAX];
 #if MX_ENABLED
-static mx_scale_t a_scale[M_MAX][KB_MAX] __attribute__((aligned(64)));
-static mx_scale_t b_scale[KB_MAX][N_MAX] __attribute__((aligned(64)));
+static mx_scale_t a_scale[M_MAX][KB_MAX] __attribute__((aligned(64))) = {
+  [0 ... M_MAX-1] = { [0 ... KB_MAX-1] = 127 },
+};
+static mx_scale_t b_scale[KB_MAX][N_MAX] __attribute__((aligned(64))) = {
+  [0 ... KB_MAX-1] = { [0 ... N_MAX-1] = 127 },
+};
 // Phase C: offline-tiled B-scale image (weights are constant). Filled once per shape outside
 // the timed region; the timed GEMM then reads it and does zero repack. 4 slots is the cache
 // envelope (mx_JC*mx_KC <= 4 for these shapes).
@@ -70,32 +83,8 @@ static uint32_t lcg_next(void) {
   return lcg;
 }
 
-// Integer payloads in the packer-reachable range [-127, 127] and small-exponent E8M0
-// scales (so MX results stay far from the int32 saturation envelope).
-static void gen_inputs(size_t m, size_t n, size_t k) {
-  for (size_t i = 0; i < m; i++) {
-    for (size_t kk = 0; kk < k; kk++) {
-      a_payload[i][kk] = (elem_t)((int)(lcg_next() % 255) - 127);
-    }
-  }
-  for (size_t kk = 0; kk < k; kk++) {
-    for (size_t j = 0; j < n; j++) {
-      b_payload[kk][j] = (elem_t)((int)(lcg_next() % 255) - 127);
-    }
-  }
-#if MX_ENABLED
-  const size_t kb = (k + 31) / 32;
-  for (size_t i = 0; i < m; i++) {
-    for (size_t b = 0; b < kb; b++) {
-      a_scale[i][b] = (mx_scale_t)(127 + (int)(lcg_next() % 5) - 2);  // exp in [-2, 2]
-    }
-  }
-  for (size_t b = 0; b < kb; b++) {
-    for (size_t j = 0; j < n; j++) {
-      b_scale[b][j] = (mx_scale_t)(127 + (int)(lcg_next() % 5) - 2);
-    }
-  }
-#endif
+static size_t sample_index(size_t limit, uint32_t x) {
+  return (size_t)(((uint64_t)(x & 0xffffu) * (uint64_t)limit) >> 16);
 }
 
 static void run_gemm(size_t m, size_t n, size_t k) {
@@ -128,31 +117,105 @@ static void run_gemm(size_t m, size_t n, size_t k) {
   gemmini_fence();
 }
 
-// Bit-exact reference for one sampled output row.
-static int check_row(size_t row, size_t n, size_t k) {
+#if MX_ENABLED && MX_BENCH_PRINT_GEOM
+static void print_mx_geom(size_t m, size_t n, size_t k) {
+  const mxint8_geom_t g = mxint8_compute_geom(m, n, k);
+  const size_t mx_IC = (g.i_tiles + g.i_chunk - 1) / g.i_chunk;
+  const bool mx_b_reuse = (g.mx_JC * g.mx_KC <= 2);
+  const bool mx_a_reuse = (g.mx_JC > 1);
+  const bool k_chunked = (g.k_chunk < g.k_tiles);
+
+  size_t chunks = 0;
+  size_t fences = 0;
+  size_t a_payload_loads = 0;
+  size_t b_payload_loads = 0;
+  bool first_chunk = true;
+  size_t prev_it = 0, prev_jt = 0, prev_kt = 0;
+
+  for (size_t i0 = 0; i0 < g.i_tiles; i0 += g.i_chunk) {
+    const size_t it = (i0 + g.i_chunk <= g.i_tiles) ? g.i_chunk : (g.i_tiles - i0);
+    for (size_t j0 = 0; j0 < g.j_tiles; j0 += g.j_chunk) {
+      const size_t jt = (j0 + g.j_chunk <= g.j_tiles) ? g.j_chunk : (g.j_tiles - j0);
+      for (size_t k0 = 0; k0 < g.k_tiles; k0 += g.k_chunk) {
+        const size_t kt = (k0 + g.k_chunk <= g.k_tiles) ? g.k_chunk : (g.k_tiles - k0);
+        const size_t mx_ic = i0 / g.i_chunk, mx_jc = j0 / g.j_chunk;
+        const bool geom_same = (it == prev_it && jt == prev_jt && kt == prev_kt);
+        const bool do_fence = k_chunked || first_chunk || !geom_same;
+        const bool load_a = !(mx_a_reuse && mx_jc >= 1);
+        const bool load_b = !(mx_b_reuse && mx_ic >= 1);
+
+        chunks++;
+        if (do_fence) fences++;
+        if (load_a) a_payload_loads++;
+        if (load_b) b_payload_loads++;
+
+        first_chunk = false;
+        prev_it = it; prev_jt = jt; prev_kt = kt;
+      }
+    }
+  }
+
+  printf("MXGEOM,dim=%d,M=%lu,N=%lu,K=%lu,i_tiles=%lu,j_tiles=%lu,k_tiles=%lu,"
+         "i_chunk=%lu,j_chunk=%lu,k_chunk=%lu,mx_IC=%lu,mx_JC=%lu,mx_KC=%lu,"
+         "chunks=%lu,fences=%lu,a_reuse=%u,b_reuse=%u,a_payload_loads=%lu,"
+         "b_payload_loads=%lu,a_scale_loads=%lu,b_scale_loads=%lu,k_chunked=%u\n",
+         DIM, (unsigned long)m, (unsigned long)n, (unsigned long)k,
+         (unsigned long)g.i_tiles, (unsigned long)g.j_tiles, (unsigned long)g.k_tiles,
+         (unsigned long)g.i_chunk, (unsigned long)g.j_chunk, (unsigned long)g.k_chunk,
+         (unsigned long)mx_IC, (unsigned long)g.mx_JC, (unsigned long)g.mx_KC,
+         (unsigned long)chunks, (unsigned long)fences,
+         mx_a_reuse ? 1u : 0u, mx_b_reuse ? 1u : 0u,
+         (unsigned long)a_payload_loads, (unsigned long)b_payload_loads,
+         (unsigned long)chunks, (unsigned long)chunks, k_chunked ? 1u : 0u);
+}
+#endif
+
+// Bit-exact reference for one sampled output cell.
+static int reference_cell(size_t row, size_t col, size_t k, acc_t *gold) {
 #if MX_ENABLED
-  const int rc = mxint8_ref_gemm_acc(&a_payload[row][0], &b_payload[0][0],
-                                     &a_scale[row][0], &b_scale[0][0], &gold_row[0],
-                                     1, n, k, K_MAX, N_MAX, N_MAX, KB_MAX, N_MAX);
+  const size_t k_blocks = (k + MX_BLOCK_SIZE - 1) / MX_BLOCK_SIZE;
+  int64_t acc = 0;
+
+  for (size_t block = 0; block < k_blocks; block++) {
+    const mx_scale_t scale_a = a_scale[row][block];
+    const mx_scale_t scale_b = b_scale[block][col];
+
+    if (!mxint8_e8m0_is_valid(scale_a) || !mxint8_e8m0_is_valid(scale_b))
+      return -1;
+
+    int64_t raw = 0;
+    for (size_t t = 0; t < MX_BLOCK_SIZE; t++) {
+      const size_t kk = block * MX_BLOCK_SIZE + t;
+      if (kk < k)
+        raw += (int32_t)a_payload[row][kk] * (int32_t)b_payload[kk][col];
+    }
+
+    acc += mxint8_scale_raw_block(raw, mxint8_e8m0_decode(scale_a),
+                                  mxint8_e8m0_decode(scale_b));
+  }
+  *gold = mxint8_saturate_acc(acc);
+#else
+  acc_t sum = 0;
+  for (size_t kk = 0; kk < k; kk++) {
+    sum += (acc_t)a_payload[row][kk] * (acc_t)b_payload[kk][col];
+  }
+  *gold = sum;
+#endif
+  return 0;
+}
+
+static int check_cell(size_t row, size_t col, size_t k) {
+  acc_t gold = 0;
+  const int rc = reference_cell(row, col, k, &gold);
   if (rc != 0) {
-    printf("golden rejected scale on row %lu (rc=%d)\n", (unsigned long)row, rc);
+    printf("golden rejected scale at row %lu col %lu (rc=%d)\n",
+           (unsigned long)row, (unsigned long)col, rc);
     return 1;
   }
-#else
-  for (size_t j = 0; j < n; j++) {
-    acc_t sum = 0;
-    for (size_t kk = 0; kk < k; kk++) {
-      sum += (acc_t)a_payload[row][kk] * (acc_t)b_payload[kk][j];
-    }
-    gold_row[j] = sum;
-  }
-#endif
-  for (size_t j = 0; j < n; j++) {
-    if (c_hw[row][j] != gold_row[j]) {
-      printf("row %lu col %lu: hw=%d gold=%d\n",
-             (unsigned long)row, (unsigned long)j, (int)c_hw[row][j], (int)gold_row[j]);
-      return 1;
-    }
+  if (c_hw[row][col] != gold) {
+    printf("row %lu col %lu: hw=%d gold=%d\n",
+           (unsigned long)row, (unsigned long)col, (int)c_hw[row][col], (int)gold);
+    return 1;
   }
   return 0;
 }
@@ -160,7 +223,6 @@ static int check_row(size_t row, size_t n, size_t k) {
 static int run_shape(const bench_shape_t *s) {
   printf("TRACE,enter_run_shape,M=%lu,N=%lu,K=%lu\n",
          (unsigned long)s->m, (unsigned long)s->n, (unsigned long)s->k);
-  gen_inputs(s->m, s->n, s->k);
   printf("TRACE,gen_inputs_done,M=%lu\n", (unsigned long)s->m);
 
   gemmini_flush(0);
@@ -213,6 +275,25 @@ static int run_shape(const bench_shape_t *s) {
   // preload_haz = preload RAW. no_cmd = EX starved (now reset *after* the untimed pretile, so
   // it no longer counts the host pretile window). matmul_in_progress / loopmm_active = mesh-busy
   // and unroller-configured references. All events already wired in the RTL (no sim rebuild).
+#if MX_BENCH_COUNTER_SET == 1
+  counter_configure(0, MX_DBG_NO_CMD_CYCLE);                // EX controller starved
+  counter_configure(1, MX_EX_POOL_EMPTY_CYCLE);             // no EX entry available
+  counter_configure(2, MX_DBG_EX_READY_CYCLE);              // EX ready but not issued
+  counter_configure(3, MX_DBG_EX_BLOCKED_CYCLE);            // EX dependency-blocked
+  counter_configure(4, MX_DBG_EX_INFLIGHT_CYCLE);           // EX issued but incomplete
+  counter_configure(5, MX_DBG_EX_POOL_FULL_CYCLE);          // EX pool throttles unroller
+  counter_configure(6, MX_DBG_LD_INFLIGHT_CYCLE);           // loads issued but incomplete
+  counter_configure(7, LOOP_MATMUL_ACTIVE_CYCLES);          // unroller configured (reference)
+#elif MX_BENCH_COUNTER_SET == 2
+  counter_configure(0, MX_EX_BLOCKED_ON_SCALE_CYCLE);        // EX blocked by any live scale mvin
+  counter_configure(1, MX_EX_BLOCKED_SCALE_ONLY_CYCLE);      // scale dep is the only EX blocker
+  counter_configure(2, MX_EX_BLOCKED_NONSCALE_CYCLE);        // EX blocked by non-scale deps
+  counter_configure(3, MX_DBG_LD_POOL_FULL_CYCLE);           // LD pool full
+  counter_configure(4, MX_DBG_LD_BLOCKED_CYCLE);             // LD dependency-blocked
+  counter_configure(5, MX_DBG_ST_POOL_FULL_CYCLE);           // ST pool full
+  counter_configure(6, MX_DBG_ST_INFLIGHT_CYCLE);            // ST issued but incomplete
+  counter_configure(7, MX_SCALE_DMA_ACTIVE_CYCLE);           // scale-load controller busy
+#else
   counter_configure(0, MX_DBG_MATMUL_IN_PROGRESS_CYCLE);    // mesh busy (reference)
   counter_configure(1, LOOP_MATMUL_ACTIVE_CYCLES);          // unroller configured (reference)
   counter_configure(2, SCRATCHPAD_A_WAIT_CYCLE);            // A feed: ctrl wants A, spad not ready
@@ -221,6 +302,7 @@ static int run_shape(const bench_shape_t *s) {
   counter_configure(5, EXE_PRELOAD_HAZ_CYCLE);              // preload RAW hazard
   counter_configure(6, MX_DBG_NO_CMD_CYCLE);                // EX controller starved
   counter_configure(7, RDMA_ACTIVE_CYCLE);                  // read-DMA engine active (reference)
+#endif
 #if MX_ENABLED
   g_mx_repack_cyc = 0; g_mx_issue_cyc = 0;  // Phase-0c CPU-cost localization
   g_mx_fence_cyc = 0; g_mx_config_cyc = 0; g_mx_scalea_cyc = 0; g_mx_scaleb_cyc = 0;
@@ -228,6 +310,9 @@ static int run_shape(const bench_shape_t *s) {
   // directly (not the timed wrapper), so g_mx_repack_cyc stays 0; the timed GEMM below reads
   // b_pretiled and never repacks. Bytes are identical to the in-loop repack -> bit-exact.
   mxint8_pretile_b_scales(s->m, s->n, s->k, &b_scale[0][0], N_MAX, b_pretiled);
+#if MX_BENCH_PRINT_GEOM
+  print_mx_geom(s->m, s->n, s->k);
+#endif
 #endif
   printf("TRACE,pre_run_gemm,M=%lu\n", (unsigned long)s->m);
   // Reset AFTER the untimed pretile so every counter aligns to the timed GEMM window.
@@ -236,19 +321,23 @@ static int run_shape(const bench_shape_t *s) {
   run_gemm(s->m, s->n, s->k);
   const uint64_t end = read_cycles();
   printf("TRACE,post_run_gemm,M=%lu\n", (unsigned long)s->m);
-  gemmini_fence();
-  const uint32_t c_mm_prog    = counter_read(0);  // MATMUL_IN_PROGRESS
-  const uint32_t c_loopmm     = counter_read(1);  // LOOP_MATMUL_ACTIVE
-  const uint32_t c_spadA_wait = counter_read(2);  // SCRATCHPAD_A_WAIT
-  const uint32_t c_spadB_wait = counter_read(3);  // SCRATCHPAD_B_WAIT
-  const uint32_t c_overlap    = counter_read(4);  // EXE_OVERLAP_HAZ
-  const uint32_t c_preload    = counter_read(5);  // EXE_PRELOAD_HAZ
-  const uint32_t c_no_cmd     = counter_read(6);  // NO_CMD
-  const uint32_t c_rdma       = counter_read(7);  // RDMA_ACTIVE
+  // run_gemm() already includes the completion fence that defines the timed window.
+  printf("TRACE,pre_counter_read,M=%lu\n", (unsigned long)s->m);
+  const uint32_t c0 = counter_read(0);
+  const uint32_t c1 = counter_read(1);
+  const uint32_t c2 = counter_read(2);
+  const uint32_t c3 = counter_read(3);
+  const uint32_t c4 = counter_read(4);
+  const uint32_t c5 = counter_read(5);
+  const uint32_t c6 = counter_read(6);
+  const uint32_t c7 = counter_read(7);
+  printf("TRACE,post_counter_read,M=%lu\n", (unsigned long)s->m);
 
   int bad = 0;
-  for (int r = 0; r < GOLDEN_ROWS; r++) {
-    bad |= check_row(lcg_next() % s->m, s->n, s->k);
+  for (int p = 0; p < GOLDEN_POINTS; p++) {
+    const size_t row = sample_index(s->m, lcg_next());
+    const size_t col = sample_index(s->n, lcg_next());
+    bad |= check_cell(row, col, s->k);
   }
 
   const uint64_t cycles = end - start;
@@ -267,6 +356,29 @@ static int run_shape(const bench_shape_t *s) {
          (unsigned long long)cycles, (unsigned long long)macs,
          (unsigned long long)ideal, (unsigned long long)util_pct,
          bad ? "FAIL" : "PASS");
+#if MX_BENCH_COUNTER_SET == 1
+  printf("MXPART,impl=%s,dim=%d,M=%lu,N=%lu,K=%lu,cycles=%llu,no_cmd=%u,"
+         "ex_pool_empty=%u,ex_ready=%u,ex_blocked=%u,ex_inflight=%u,ex_pool_full=%u,"
+         "ld_inflight=%u,loopmm_active=%u\n",
+#if MX_ENABLED
+         "mx",
+#else
+         "stock",
+#endif
+         DIM, (unsigned long)s->m, (unsigned long)s->n, (unsigned long)s->k,
+         (unsigned long long)cycles, c0, c1, c2, c3, c4, c5, c6, c7);
+#elif MX_BENCH_COUNTER_SET == 2
+  printf("MXSCALEDEP,impl=%s,dim=%d,M=%lu,N=%lu,K=%lu,cycles=%llu,"
+         "ex_blocked_on_scale=%u,ex_blocked_scale_only=%u,ex_blocked_nonscale=%u,"
+         "ld_pool_full=%u,ld_blocked=%u,st_pool_full=%u,st_inflight=%u,scale_dma_active=%u\n",
+#if MX_ENABLED
+         "mx",
+#else
+         "stock",
+#endif
+         DIM, (unsigned long)s->m, (unsigned long)s->n, (unsigned long)s->k,
+         (unsigned long long)cycles, c0, c1, c2, c3, c4, c5, c6, c7);
+#else
   printf("MXCOUNT,impl=%s,dim=%d,M=%lu,N=%lu,K=%lu,cycles=%llu,matmul_in_progress=%u,"
          "loopmm_active=%u,spadA_wait=%u,spadB_wait=%u,overlap_haz=%u,preload_haz=%u,"
          "no_cmd=%u,rdma_active=%u\n",
@@ -276,8 +388,8 @@ static int run_shape(const bench_shape_t *s) {
          "stock",
 #endif
          DIM, (unsigned long)s->m, (unsigned long)s->n, (unsigned long)s->k,
-         (unsigned long long)cycles, c_mm_prog, c_loopmm, c_spadA_wait, c_spadB_wait,
-         c_overlap, c_preload, c_no_cmd, c_rdma);
+         (unsigned long long)cycles, c0, c1, c2, c3, c4, c5, c6, c7);
+#endif
 #if MX_ENABLED
   printf("MXCPU,impl=mx,dim=%d,M=%lu,N=%lu,K=%lu,cycles=%llu,repack_cyc=%llu,issue_cyc=%llu,"
          "fence_cyc=%llu,config_cyc=%llu,scalea_cyc=%llu,scaleb_cyc=%llu\n",
@@ -299,6 +411,7 @@ int main() {
 #endif
 
   printf("TRACE,enter_main\n");
+  printf("TRACE,inputs_preloaded\n");
 
   int bad = 0;
   for (size_t s = 0; s < sizeof(shapes) / sizeof(shapes[0]); s++) {

@@ -63,7 +63,6 @@
 #define k_CONFIG_MXINT8 26
 #define k_MVIN_MXSCALE_A 27
 #define k_MVIN_MXSCALE_B 28
-#define k_LOOP_WS_MXINT8 29
 
 #define CONFIG_EX 0
 #define CONFIG_LD 1
@@ -545,6 +544,9 @@ static inline uint64_t mx_rdcycle_(void) { uint64_t c; __asm__ volatile ("rdcycl
 // repack into the internal ping-pong buffer (all direct callers keep that behavior).
 static mx_scale_t *g_mx_btile_cache = NULL;
 static bool g_mx_btile_valid = false;
+#if DIM >= 32
+static bool g_mx_bscale_resident = false;
+#endif
 
 // Element count of one per-(j,k) tiled B-scale image (the max image, per the
 // k_blocks*jp <= MX_SCALE_SP_ROWS/2 envelope). Used to size both the internal per-chunk
@@ -678,21 +680,27 @@ _STATIC void gemmini_loop_ws_mxint8(size_t I, size_t J, size_t K,
   // dense stride, power-of-two J), load it directly; otherwise repack on the host first.
   const size_t b_scale_addr = MX_SCALE_SP_ROWS / 2 + mxint8_pp_off;
   const uint64_t _sb0 = mx_rdcycle_();
-  if (n_cols == jp * DIM && B_scale_stride == n_cols) {
-    gemmini_mvin_mxscale_b(B_scale, b_scale_addr, k_blocks * jp, DIM, DIM);
-  } else {
-    // Tile into the tiler-provided per-(j,k) cache when present (repack once, reuse across
-    // i0); else the legacy internal ping-pong buffer (re-tiled every call).
-    mx_scale_t *btile = (g_mx_btile_cache != NULL) ? g_mx_btile_cache
-                                                   : mxint8_b_scale_tiled[mxint8_pp_buf];
-    if (!(g_mx_btile_cache != NULL && g_mx_btile_valid)) {
-      const uint64_t _rp0 = mx_rdcycle_();
-      mxint8_repack_b_scales_tiled(B_scale, k_blocks, n_cols, B_scale_stride, jp, btile);
-      g_mx_repack_cyc += mx_rdcycle_() - _rp0;
-      if (g_mx_btile_cache != NULL) g_mx_btile_valid = true;
+#if DIM >= 32
+  if (!g_mx_bscale_resident) {
+#endif
+    if (n_cols == jp * DIM && B_scale_stride == n_cols) {
+      gemmini_mvin_mxscale_b(B_scale, b_scale_addr, k_blocks * jp, DIM, DIM);
+    } else {
+      // Tile into the tiler-provided per-(j,k) cache when present (repack once, reuse across
+      // i0); else the legacy internal ping-pong buffer (re-tiled every call).
+      mx_scale_t *btile = (g_mx_btile_cache != NULL) ? g_mx_btile_cache
+                                                     : mxint8_b_scale_tiled[mxint8_pp_buf];
+      if (!(g_mx_btile_cache != NULL && g_mx_btile_valid)) {
+        const uint64_t _rp0 = mx_rdcycle_();
+        mxint8_repack_b_scales_tiled(B_scale, k_blocks, n_cols, B_scale_stride, jp, btile);
+        g_mx_repack_cyc += mx_rdcycle_() - _rp0;
+        if (g_mx_btile_cache != NULL) g_mx_btile_valid = true;
+      }
+      gemmini_mvin_mxscale_b(btile, b_scale_addr, k_blocks * jp, DIM, DIM);
     }
-    gemmini_mvin_mxscale_b(btile, b_scale_addr, k_blocks * jp, DIM, DIM);
+#if DIM >= 32
   }
+#endif
   g_mx_scaleb_cyc += mx_rdcycle_() - _sb0;  // pure mvin issue (repack skipped on the pretiled path)
 
   if (!setup_only) {
@@ -888,6 +896,9 @@ _STATIC void tiled_matmul_mxint8_impl(size_t M, size_t N, size_t K,
   // validity forced true — no repack ever happens inside the (timed) loop.
   static mx_scale_t mx_btile_cache[4][MX_PRETILE_SLOT_ELEMS];
   static bool mx_btile_valid[4];
+#if DIM >= 32
+  static bool mx_bscale_resident[4][2];
+#endif
   const bool mx_use_btile_cache = (b_pretiled != NULL) || (mx_JC * mx_KC <= 4);
   if (b_pretiled == NULL && mx_use_btile_cache) {
     for (size_t t = 0; t < mx_JC * mx_KC; t++) mx_btile_valid[t] = false;
@@ -895,15 +906,24 @@ _STATIC void tiled_matmul_mxint8_impl(size_t M, size_t N, size_t K,
 
   // Payload-operand reuse (mirrors stock tiled_matmul_outer): when all B chunks fit the two
   // scratchpad ping-pong regions (mx_JC*mx_KC <= 2), load B once at i0==0 and REUSE it across
-  // the i-sweep (b_spad_id selects the resident region, B_payload=NULL skips the re-mvin);
-  // likewise A across the j-sweep when all A chunks fit. Without this the MX tiler re-fetched B
-  // for every i-chunk -> 2x the read-DMA bytes of stock, starving the mesh feed (measured). The
-  // scale sidecar (per-chunk scale-mvins, ping-pong parity, B-scale cache) is orthogonal and
-  // unchanged. spad_id 0 = no reuse (byte-identical to the prior behavior -> bit-exact when the
-  // condition is false).
+  // the i-sweep (b_spad_id selects the resident region, B_payload=NULL skips the re-mvin).
+  // A only needs to stay resident across the j-sweep for the current (ic,kc), so it can reuse
+  // whenever there is more than one j chunk; resident IDs alternate by (ic,kc). The scale
+  // sidecar (per-chunk scale-mvins, ping-pong parity, B-scale cache) is orthogonal and
+  // unchanged. spad_id 0 = no reuse (byte-identical to the prior behavior when false).
   const size_t mx_IC = (i_tiles + i_chunk - 1) / i_chunk;
   const bool mx_b_reuse = (mx_JC * mx_KC <= 2);
-  const bool mx_a_reuse = (mx_IC * mx_KC <= 2);
+  const bool mx_a_reuse = (mx_JC > 1);
+#if DIM >= 32
+  const bool mx_use_bscale_residency = mx_b_reuse && mx_use_btile_cache &&
+      (mx_JC * mx_KC <= 4) && (mx_IC > 2) && !k_chunked;
+  if (mx_use_bscale_residency) {
+    for (size_t t = 0; t < 4; t++) {
+      mx_bscale_resident[t][0] = false;
+      mx_bscale_resident[t][1] = false;
+    }
+  }
+#endif
 
   for (size_t i0 = 0; i0 < i_tiles; i0 += i_chunk) {
     const size_t it = (i0 + i_chunk <= i_tiles) ? i_chunk : (i_tiles - i0);
@@ -944,6 +964,7 @@ _STATIC void tiled_matmul_mxint8_impl(size_t M, size_t N, size_t K,
         // repacks only on the first i0 and reuses it thereafter. With b_pretiled the image is
         // already valid (filled offline), so no repack happens at all.
         size_t mx_slot = 0;
+        int pp_idx = (pp == 1) ? 1 : 0;
         if (mx_use_btile_cache) {
           mx_slot = (j0 / j_chunk) * mx_KC + (k0 / k_chunk);
           if (b_pretiled != NULL) {
@@ -963,12 +984,16 @@ _STATIC void tiled_matmul_mxint8_impl(size_t M, size_t N, size_t K,
         // (jc,kc)). When a chunk is the operand's first use, the payload pointer stays non-NULL
         // (it must be loaded); NULL only on a genuine reuse iteration.
         const size_t mx_ic = i0 / i_chunk, mx_jc = j0 / j_chunk, mx_kc = k0 / k_chunk;
-        const int a_sid = mx_a_reuse ? (((mx_ic + mx_kc) == 0) ? 1 : 2) : 0;
+        const int a_sid = mx_a_reuse ? (1 + (int)((mx_ic + mx_kc) & 1)) : 0;
         const int b_sid = mx_b_reuse ? (((mx_jc + mx_kc) == 0) ? 1 : 2) : 0;
         const elem_t *a_ptr = A_payload + i0 * DIM * A_stride + k0 * DIM;
         const elem_t *b_ptr = B_payload + k0 * DIM * B_stride + j0 * DIM;
         if (mx_a_reuse && mx_jc >= 1) a_ptr = NULL;  // A(ic,kc) already resident from jc==0
         if (mx_b_reuse && mx_ic >= 1) b_ptr = NULL;  // B(jc,kc) already resident from ic==0
+#if DIM >= 32
+        g_mx_bscale_resident = mx_use_bscale_residency &&
+            mx_bscale_resident[mx_slot][pp_idx];
+#endif
 
         gemmini_loop_ws_mxint8(it, jt, kt, pad_i, pad_j, pad_k,
             a_ptr,
@@ -983,8 +1008,14 @@ _STATIC void tiled_matmul_mxint8_impl(size_t M, size_t N, size_t K,
             /*a_spad_id=*/a_sid, /*b_spad_id=*/b_sid, /*is_resadd=*/false,
             /*pipeline_parity=*/pp, /*fence_first=*/do_fence, /*setup_only=*/false);
 
+#if DIM >= 32
+        if (mx_use_bscale_residency) mx_bscale_resident[mx_slot][pp_idx] = true;
+#endif
         if (mx_use_btile_cache && b_pretiled == NULL) mx_btile_valid[mx_slot] = g_mx_btile_valid;
         g_mx_btile_cache = NULL;  // restore default for any other (direct) callers
+#if DIM >= 32
+        g_mx_bscale_resident = false;
+#endif
 
         since_fence = do_fence ? 1 : (since_fence + 1);
         first_chunk = false;

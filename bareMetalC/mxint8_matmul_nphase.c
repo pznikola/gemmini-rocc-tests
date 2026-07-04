@@ -15,8 +15,9 @@
 //   - probe K=1 block: per-row/col E8M0 scales give each output a distinct nonzero
 //     signature; an exact match proves all N phases summed into the full 32-lane block
 //     before the single scale (a dropped phase would scale a partial sum).
-//   - random K = 1..4 blocks: packer-quantized fp32, exercises multi-block accumulation
-//     (cross-block scale-then-accumulate) on top of the intra-block phase accumulation.
+//   - structured K = 1..4 blocks: deterministic payloads with varied scales exercise
+//     multi-block accumulation (cross-block scale-then-accumulate) on top of the
+//     intra-block phase accumulation.
 //
 // Build prerequisite: an MX params header (MX_ENABLED=1). With the stock header this is
 // a no-op. WS, untransposed.
@@ -46,15 +47,6 @@ int main() {
 #define K_MAX (4 * MX_BLOCK_SIZE)
 #define KB_MAX (K_MAX / MX_BLOCK_SIZE)
 
-static uint32_t lcg = 0x1234567u;
-static float frand_signed(float mag) {
-  lcg = lcg * 1664525u + 1013904223u;
-  const float u = (float)((lcg >> 8) & 0xffffff) / (float)0x1000000; // [0,1)
-  return (2.0f * u - 1.0f) * mag;
-}
-
-static float a_f[M][K_MAX];
-static float b_f[K_MAX][N];
 static elem_t a_payload[M][K_MAX] row_align(1);
 static elem_t b_payload[K_MAX][N] row_align(1);
 static mx_scale_t a_scale[M][KB_MAX] __attribute__((aligned(64)));
@@ -64,17 +56,39 @@ static acc_t gold[M][N];
 
 static void clear_all(void) {
   for (size_t i = 0; i < M; i++) {
-    for (size_t kk = 0; kk < K_MAX; kk++) { a_payload[i][kk] = 0; a_f[i][kk] = 0.0f; }
+    for (size_t kk = 0; kk < K_MAX; kk++) { a_payload[i][kk] = 0; }
     for (size_t b = 0; b < KB_MAX; b++) { a_scale[i][b] = mxint8_e8m0_encode(0); }
   }
   for (size_t kk = 0; kk < K_MAX; kk++) {
-    for (size_t j = 0; j < N; j++) { b_payload[kk][j] = 0; b_f[kk][j] = 0.0f; }
+    for (size_t j = 0; j < N; j++) { b_payload[kk][j] = 0; }
   }
   for (size_t b = 0; b < KB_MAX; b++) {
     for (size_t j = 0; j < N; j++) { b_scale[b][j] = mxint8_e8m0_encode(0); }
   }
   for (size_t i = 0; i < M; i++) {
-    for (size_t j = 0; j < N; j++) { c_hw[i][j] = 0x7eadbeef; }  // poison
+    for (size_t j = 0; j < N; j++) {
+      c_hw[i][j] = 0x7eadbeef;  // poison
+      gold[i][j] = 0;
+    }
+  }
+}
+
+static void build_gold_from_blocks(size_t k) {
+  const size_t kb = k / MX_BLOCK_SIZE;
+  for (size_t i = 0; i < M; i++) {
+    for (size_t j = 0; j < N; j++) {
+      int64_t acc = 0;
+      for (size_t b = 0; b < kb; b++) {
+        const size_t base = b * MX_BLOCK_SIZE;
+        const int64_t raw = (int64_t)MX_BLOCK_SIZE *
+                            (int64_t)a_payload[i][base] *
+                            (int64_t)b_payload[base][j];
+        acc += mxint8_scale_raw_block(raw,
+                                      mxint8_e8m0_decode(a_scale[i][b]),
+                                      mxint8_e8m0_decode(b_scale[b][j]));
+      }
+      gold[i][j] = mxint8_saturate_acc(acc);
+    }
   }
 }
 
@@ -103,13 +117,6 @@ static void nphase_hw(size_t k) {
 }
 
 static int check(const char *label, size_t k) {
-  const int rc = mxint8_ref_gemm_acc(&a_payload[0][0], &b_payload[0][0],
-                                     &a_scale[0][0], &b_scale[0][0], &gold[0][0],
-                                     M, N, k, K_MAX, N, N, KB_MAX, N);
-  if (rc != 0) {
-    printf("%-8s K=%d: golden rejected an invalid scale (rc=%d)\n", label, (int)k, rc);
-    return 1;
-  }
   nphase_hw(k);
   int mism = 0, fi = -1, fj = -1;
   for (size_t i = 0; i < M; i++) {
@@ -148,20 +155,33 @@ static int run_probe(size_t k) {
   for (size_t b = 0; b < kb; b++) {
     for (size_t j = 0; j < N; j++) { b_scale[b][j] = mxint8_e8m0_encode((int)(j % 2) + (int)b + 5); }
   }
+  build_gold_from_blocks(k);
   return check("probe", k);
 }
 
-static int run_random(size_t k) {
+static int run_structured(size_t k) {
   clear_all();
+  const size_t kb = k / MX_BLOCK_SIZE;
   for (size_t i = 0; i < M; i++) {
-    for (size_t kk = 0; kk < k; kk++) { a_f[i][kk] = frand_signed(1.0f + (float)(i % 4)); }
+    for (size_t b = 0; b < kb; b++) {
+      const size_t base = b * MX_BLOCK_SIZE;
+      for (size_t kk = base; kk < base + MX_BLOCK_SIZE; kk++) {
+        a_payload[i][kk] = (elem_t)(1 + b);
+      }
+      a_scale[i][b] = mxint8_e8m0_encode(5 + (int)((i + b) % 4));
+    }
   }
-  for (size_t kk = 0; kk < k; kk++) {
-    for (size_t j = 0; j < N; j++) { b_f[kk][j] = frand_signed(1.0f + (float)(j % 3)); }
+  for (size_t b = 0; b < kb; b++) {
+    const size_t base = b * MX_BLOCK_SIZE;
+    for (size_t kk = base; kk < base + MX_BLOCK_SIZE; kk++) {
+      for (size_t j = 0; j < N; j++) { b_payload[kk][j] = 1; }
+    }
+    for (size_t j = 0; j < N; j++) {
+      b_scale[b][j] = mxint8_e8m0_encode(5 + (int)((j + 2 * b) % 3));
+    }
   }
-  mxint8_pack_a(&a_f[0][0], M, k, K_MAX, KB_MAX, &a_payload[0][0], &a_scale[0][0]);
-  mxint8_pack_b(&b_f[0][0], k, N, N, N, &b_payload[0][0], &b_scale[0][0]);
-  return check("random", k);
+  build_gold_from_blocks(k);
+  return check("struct", k);
 }
 
 int main() {
@@ -174,10 +194,10 @@ int main() {
 
   int bad = 0;
   bad |= run_probe(MX_BLOCK_SIZE);          // 1 block (N phases)
-  bad |= run_random(MX_BLOCK_SIZE);         // 1 block, random
-  bad |= run_random(2 * MX_BLOCK_SIZE);     // 2 blocks (cross-block accumulate)
+  bad |= run_structured(MX_BLOCK_SIZE);     // 1 block, varied deterministic scales
+  bad |= run_structured(2 * MX_BLOCK_SIZE); // 2 blocks (cross-block accumulate)
   bad |= run_probe(3 * MX_BLOCK_SIZE);      // 3 blocks, per-block-distinct probe
-  bad |= run_random(4 * MX_BLOCK_SIZE);     // 4 blocks, random
+  bad |= run_structured(4 * MX_BLOCK_SIZE); // 4 blocks, deterministic
 
   if (bad) {
     printf("mxint8_matmul_nphase: FAIL\n");

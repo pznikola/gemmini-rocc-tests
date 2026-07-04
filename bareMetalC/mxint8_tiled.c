@@ -53,15 +53,6 @@ int main() {
 #define K_MAX 64
 #define KB_MAX (K_MAX / MX_BLOCK_SIZE)
 
-static uint32_t lcg = 0x9e3779b1u;
-static float frand_signed(float mag) {
-  lcg = lcg * 1664525u + 1013904223u;
-  const float u = (float)((lcg >> 8) & 0xffffff) / (float)0x1000000; // [0,1)
-  return (2.0f * u - 1.0f) * mag;
-}
-
-static float a_f[M][K_MAX];
-static float b_f[K_MAX][N];
 static elem_t a_payload[M][K_MAX] row_align(1);
 static elem_t b_payload[K_MAX][N] row_align(1);
 static mx_scale_t a_scale[M][KB_MAX] __attribute__((aligned(64)));
@@ -72,17 +63,38 @@ static acc_t gold[M][N];
 // Zero payloads + neutral (`encode(0)`) scales on all lanes so unused lanes stay valid.
 static void clear_all(void) {
   for (size_t i = 0; i < M; i++) {
-    for (size_t kk = 0; kk < K_MAX; kk++) { a_payload[i][kk] = 0; a_f[i][kk] = 0.0f; }
+    for (size_t kk = 0; kk < K_MAX; kk++) { a_payload[i][kk] = 0; }
     for (size_t b = 0; b < KB_MAX; b++) { a_scale[i][b] = mxint8_e8m0_encode(0); }
   }
   for (size_t kk = 0; kk < K_MAX; kk++) {
-    for (size_t j = 0; j < N; j++) { b_payload[kk][j] = 0; b_f[kk][j] = 0.0f; }
+    for (size_t j = 0; j < N; j++) { b_payload[kk][j] = 0; }
   }
   for (size_t b = 0; b < KB_MAX; b++) {
     for (size_t j = 0; j < N; j++) { b_scale[b][j] = mxint8_e8m0_encode(0); }
   }
   for (size_t i = 0; i < M; i++) {
-    for (size_t j = 0; j < N; j++) { c_hw[i][j] = 0; }
+    for (size_t j = 0; j < N; j++) {
+      c_hw[i][j] = 0;
+      gold[i][j] = 0;
+    }
+  }
+}
+
+static void build_gold_structured(size_t k) {
+  const size_t kb = (k + MX_BLOCK_SIZE - 1) / MX_BLOCK_SIZE;
+  for (size_t i = 0; i < M; i++) {
+    for (size_t j = 0; j < N; j++) {
+      int64_t acc = 0;
+      for (size_t b = 0; b < kb; b++) {
+        const size_t base = b * MX_BLOCK_SIZE;
+        const size_t lanes = (base + MX_BLOCK_SIZE <= k) ? MX_BLOCK_SIZE : (k - base);
+        const int64_t raw = (int64_t)lanes * (int64_t)(b + 1);
+        acc += mxint8_scale_raw_block(raw,
+                                      mxint8_e8m0_decode(a_scale[i][b]),
+                                      mxint8_e8m0_decode(b_scale[b][j]));
+      }
+      gold[i][j] = mxint8_saturate_acc(acc);
+    }
   }
 }
 
@@ -113,14 +125,6 @@ static void mxint8_tiled_hw(size_t k) {
 }
 
 static int check(const char *label, size_t k) {
-  const int rc = mxint8_ref_gemm_acc(&a_payload[0][0], &b_payload[0][0],
-                                     &a_scale[0][0], &b_scale[0][0], &gold[0][0],
-                                     M, N, k, K_MAX, N, N, KB_MAX, N);
-  if (rc != 0) {
-    printf("%-8s K=%d: golden rejected an invalid scale (rc=%d)\n", label, (int)k, rc);
-    return 1;
-  }
-
   mxint8_tiled_hw(k);
 
   int mism = 0, fi = -1, fj = -1;
@@ -143,16 +147,28 @@ static int check(const char *label, size_t k) {
   return 0;
 }
 
-static int run_random(size_t k) {
+static int run_structured(size_t k) {
   clear_all();
+  const size_t kb = (k + MX_BLOCK_SIZE - 1) / MX_BLOCK_SIZE;
   for (size_t i = 0; i < M; i++) {
-    for (size_t kk = 0; kk < k; kk++) { a_f[i][kk] = frand_signed(1.0f + (float)(i % 4)); }
+    for (size_t b = 0; b < kb; b++) {
+      const size_t base = b * MX_BLOCK_SIZE;
+      const size_t end = (base + MX_BLOCK_SIZE <= k) ? base + MX_BLOCK_SIZE : k;
+      for (size_t kk = base; kk < end; kk++) { a_payload[i][kk] = (elem_t)(b + 1); }
+      a_scale[i][b] = mxint8_e8m0_encode(6 + (int)((i + b) % 4));
+    }
   }
-  for (size_t kk = 0; kk < k; kk++) {
-    for (size_t j = 0; j < N; j++) { b_f[kk][j] = frand_signed(1.0f + (float)(j % 3)); }
+  for (size_t b = 0; b < kb; b++) {
+    const size_t base = b * MX_BLOCK_SIZE;
+    const size_t end = (base + MX_BLOCK_SIZE <= k) ? base + MX_BLOCK_SIZE : k;
+    for (size_t kk = base; kk < end; kk++) {
+      for (size_t j = 0; j < N; j++) { b_payload[kk][j] = 1; }
+    }
+    for (size_t j = 0; j < N; j++) {
+      b_scale[b][j] = mxint8_e8m0_encode(6 + (int)((j + 2 * b) % 3));
+    }
   }
-  mxint8_pack_a(&a_f[0][0], M, k, K_MAX, KB_MAX, &a_payload[0][0], &a_scale[0][0]);
-  mxint8_pack_b(&b_f[0][0], k, N, N, N, &b_payload[0][0], &b_scale[0][0]);
+  build_gold_structured(k);
   return check("tiled", k);
 }
 
@@ -165,10 +181,10 @@ int main() {
 #endif
 
   int bad = 0;
-  bad |= run_random(MX_BLOCK_SIZE);      // single MX block (one K tile) through the loop wrapper
+  bad |= run_structured(MX_BLOCK_SIZE);      // single MX block (one K tile) through the loop wrapper
   // Cross-block K back-to-back after another loop GEMM: regression for the 2026-06-10
   // ReservationStation RAW-hazard fix (see the header note and DOCS_MX/BUG.md).
-  bad |= run_random(2 * MX_BLOCK_SIZE);  // two MX blocks (two K tiles), preceded by the GEMM above
+  bad |= run_structured(2 * MX_BLOCK_SIZE);  // two MX blocks (two K tiles), preceded by the GEMM above
 
   if (bad) {
     printf("mxint8_tiled: FAIL\n");

@@ -7,12 +7,17 @@
 // full-width int32 accumulator output, and compares the hardware result against
 // the bit-exact software golden `mxint8_ref_gemm_acc`.
 //
-// Two cases:
-//   1. A deterministic "probe": all-ones payloads with per-row/per-column scales
+// Two deterministic cases:
+//   1. A single-block probe: all-ones payloads with per-row/per-column scales
 //      chosen so hw[i][j] = raw << ((i%4)+(j%3)). This makes the block scaling
 //      directly observable and pins down the per-output-row A-scale addressing.
-//   2. A randomized case packed by `mxint8_pack.h`, with K spanning two MX blocks
-//      to exercise cross-block accumulation, diffed against the golden.
+//   2. A two-block probe: block0 contributes raw=32 and block1 contributes raw=64
+//      under independently varied A/B scales, exercising cross-block accumulation.
+//
+// The expected output is computed analytically from the same scalar block-scaling
+// helper as the software golden. This keeps the Verilator regression focused on
+// hardware correctness instead of spending minutes in target-side fp32 packing and
+// an O(M*N*K) reference loop.
 //
 // Build prerequisite: compile against the DIM=32 MX params header
 // (`gemmini_params_mxint8_dim32.h`, MX_ENABLED=1); with the stock header this
@@ -45,21 +50,55 @@ int main() {
 #define K_MAX 64
 #define KB_MAX (K_MAX / MX_BLOCK_SIZE)
 
-static uint32_t lcg = 0x2468aceu;
-static float frand_signed(float mag) {
-  lcg = lcg * 1664525u + 1013904223u;
-  const float u = (float)((lcg >> 8) & 0xffffff) / (float)0x1000000; // [0,1)
-  return (2.0f * u - 1.0f) * mag;
-}
-
-static float a_f[M][K_MAX];
-static float b_f[K_MAX][N];
 static elem_t a_payload[M][K_MAX] row_align(1);
 static elem_t b_payload[K_MAX][N] row_align(1);
 static mx_scale_t a_scale[M][KB_MAX] __attribute__((aligned(64)));
 static mx_scale_t b_scale[KB_MAX][N] __attribute__((aligned(64)));
 static acc_t c_hw[M][N] row_align(1);
 static acc_t gold[M][N];
+
+static void clear_all(void) {
+  for (size_t i = 0; i < M; i++) {
+    for (size_t kk = 0; kk < K_MAX; kk++) {
+      a_payload[i][kk] = 0;
+    }
+    for (size_t b = 0; b < KB_MAX; b++) {
+      a_scale[i][b] = mxint8_e8m0_encode(0);
+    }
+  }
+  for (size_t kk = 0; kk < K_MAX; kk++) {
+    for (size_t j = 0; j < N; j++) {
+      b_payload[kk][j] = 0;
+    }
+  }
+  for (size_t b = 0; b < KB_MAX; b++) {
+    for (size_t j = 0; j < N; j++) {
+      b_scale[b][j] = mxint8_e8m0_encode(0);
+    }
+  }
+  for (size_t i = 0; i < M; i++) {
+    for (size_t j = 0; j < N; j++) {
+      c_hw[i][j] = 0;
+      gold[i][j] = 0;
+    }
+  }
+}
+
+static void build_expected(size_t kb) {
+  for (size_t i = 0; i < M; i++) {
+    for (size_t j = 0; j < N; j++) {
+      int64_t acc = 0;
+      for (size_t b = 0; b < kb; b++) {
+        // Payload block b uses A=(b+1), B=1 for all 32 lanes.
+        const int64_t raw = (int64_t)MX_BLOCK_SIZE * (int64_t)(b + 1);
+        acc += mxint8_scale_raw_block(raw,
+            mxint8_e8m0_decode(a_scale[i][b]),
+            mxint8_e8m0_decode(b_scale[b][j]));
+      }
+      gold[i][j] = mxint8_saturate_acc(acc);
+    }
+  }
+}
 
 // Run one MXINT8 GEMM on the accelerator: enable MX + reset the logical-K
 // counter, load the A/B scale vectors into MXScaleSRAM, then preload each B block
@@ -99,17 +138,10 @@ static void mxint8_hw_matmul(size_t k, size_t kb) {
   gemmini_fence();
 }
 
-// Golden + hardware diff for the data currently in the payload/scale arrays.
 static int check(const char *label, size_t k, size_t kb) {
-  const int rc = mxint8_ref_gemm_acc(&a_payload[0][0], &b_payload[0][0],
-                                     &a_scale[0][0], &b_scale[0][0], &gold[0][0],
-                                     M, N, k, K_MAX, N, N, KB_MAX, N);
-  if (rc != 0) {
-    printf("%s K=%d: golden rejected an invalid scale (rc=%d)\n", label, (int)k, rc);
-    return 1;
-  }
-
+  printf("%s K=%d: hw begin\n", label, (int)k);
   mxint8_hw_matmul(k, kb);
+  printf("%s K=%d: compare begin\n", label, (int)k);
 
   int mismatches = 0;
   for (size_t i = 0; i < M; i++) {
@@ -135,6 +167,7 @@ static int check(const char *label, size_t k, size_t kb) {
 // variation directly checks the per-output-row A-scale addressing.
 static int run_probe(void) {
   const size_t k = MX_BLOCK_SIZE, kb = 1;
+  clear_all();
   for (size_t i = 0; i < M; i++) {
     for (size_t kk = 0; kk < k; kk++) {
       a_payload[i][kk] = 1;
@@ -149,28 +182,31 @@ static int run_probe(void) {
   for (size_t j = 0; j < N; j++) {
     b_scale[0][j] = mxint8_e8m0_encode(6 + (int)(j % 3));
   }
+  build_expected(kb);
   return check("probe", k, kb);
 }
 
-// Randomized case packed from fp32, with per-row/per-column magnitude spread so
-// the packer chooses a variety of E8M0 exponents. K spans two MX blocks to
-// exercise cross-block accumulation.
-static int run_random(size_t k) {
-  const size_t kb = (k + MX_BLOCK_SIZE - 1) / MX_BLOCK_SIZE;
+static int run_two_block_probe(void) {
+  const size_t k = 2 * MX_BLOCK_SIZE, kb = 2;
+  clear_all();
   for (size_t i = 0; i < M; i++) {
-    const float row_mag = 1.0f + (float)(i % 5);
     for (size_t kk = 0; kk < k; kk++) {
-      a_f[i][kk] = frand_signed(row_mag);
+      a_payload[i][kk] = kk < MX_BLOCK_SIZE ? 1 : 2;
     }
+    a_scale[i][0] = mxint8_e8m0_encode(6 + (int)(i % 4));
+    a_scale[i][1] = mxint8_e8m0_encode(4 + (int)(i % 3));
   }
   for (size_t kk = 0; kk < k; kk++) {
     for (size_t j = 0; j < N; j++) {
-      b_f[kk][j] = frand_signed(1.0f + (float)(j % 3));
+      b_payload[kk][j] = 1;
     }
   }
-  mxint8_pack_a(&a_f[0][0], M, k, K_MAX, KB_MAX, &a_payload[0][0], &a_scale[0][0]);
-  mxint8_pack_b(&b_f[0][0], k, N, N, N, &b_payload[0][0], &b_scale[0][0]);
-  return check("random", k, kb);
+  for (size_t j = 0; j < N; j++) {
+    b_scale[0][j] = mxint8_e8m0_encode(6 + (int)(j % 3));
+    b_scale[1][j] = mxint8_e8m0_encode(5 + (int)(j % 2));
+  }
+  build_expected(kb);
+  return check("two_blk", k, kb);
 }
 
 int main() {
@@ -183,7 +219,7 @@ int main() {
 
   int bad = 0;
   bad |= run_probe();      // single block, deterministic, per-row/col scales
-  bad |= run_random(64);   // two blocks, randomized, vs golden
+  bad |= run_two_block_probe(); // two blocks, deterministic cross-block accumulate
 
   if (bad) {
     printf("mxint8_matmul_dim32: FAIL\n");

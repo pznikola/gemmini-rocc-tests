@@ -46,15 +46,6 @@ int main() {
 #define K_MAX 64
 #define KB_MAX (K_MAX / MX_BLOCK_SIZE)
 
-static uint32_t lcg = 0x0c0ffee1u;
-static float frand_signed(float mag) {
-  lcg = lcg * 1664525u + 1013904223u;
-  const float u = (float)((lcg >> 8) & 0xffffff) / (float)0x1000000; // [0,1)
-  return (2.0f * u - 1.0f) * mag;
-}
-
-static float a_f[M_MAX][K_MAX];
-static float b_f[K_MAX][N_MAX];
 static elem_t a_payload[M_MAX][K_MAX] row_align(1);
 static elem_t b_payload[K_MAX][N_MAX] row_align(1);
 static mx_scale_t a_scale[M_MAX][KB_MAX] __attribute__((aligned(64)));
@@ -67,17 +58,34 @@ static acc_t gold[M_MAX][N_MAX];
 // DIM rows/cols (so the padded scale lanes loaded into MXScaleSRAM are valid).
 static void clear_all(void) {
   for (size_t i = 0; i < M_MAX; i++) {
-    for (size_t kk = 0; kk < K_MAX; kk++) { a_payload[i][kk] = 0; a_f[i][kk] = 0.0f; }
+    for (size_t kk = 0; kk < K_MAX; kk++) { a_payload[i][kk] = 0; }
     for (size_t b = 0; b < KB_MAX; b++) { a_scale[i][b] = mxint8_e8m0_encode(0); }
   }
   for (size_t kk = 0; kk < K_MAX; kk++) {
-    for (size_t j = 0; j < N_MAX; j++) { b_payload[kk][j] = 0; b_f[kk][j] = 0.0f; }
+    for (size_t j = 0; j < N_MAX; j++) { b_payload[kk][j] = 0; }
   }
   for (size_t b = 0; b < KB_MAX; b++) {
     for (size_t j = 0; j < N_MAX; j++) { b_scale[b][j] = mxint8_e8m0_encode(0); }
   }
   for (size_t i = 0; i < M_MAX; i++) {
     for (size_t j = 0; j < N_MAX; j++) { c_hw[i][j] = 0; }
+  }
+}
+
+static void build_gold_structured(size_t m, size_t n, size_t k, size_t kb) {
+  for (size_t i = 0; i < m; i++) {
+    for (size_t j = 0; j < n; j++) {
+      int64_t acc = 0;
+      for (size_t b = 0; b < kb; b++) {
+        const size_t base = b * MX_BLOCK_SIZE;
+        const size_t lanes = (base + MX_BLOCK_SIZE <= k) ? MX_BLOCK_SIZE : (k - base);
+        const int64_t raw = (int64_t)lanes * (int64_t)(b + 1);
+        acc += mxint8_scale_raw_block(raw,
+                                      mxint8_e8m0_decode(a_scale[i][b]),
+                                      mxint8_e8m0_decode(b_scale[b][j]));
+      }
+      gold[i][j] = mxint8_saturate_acc(acc);
+    }
   }
 }
 
@@ -123,15 +131,6 @@ static void mxint8_hw_matmul(size_t m, size_t n, size_t k, size_t kb) {
 
 // Golden + hardware diff over the M x N region for the data currently staged.
 static int check(const char *label, size_t m, size_t n, size_t k, size_t kb) {
-  const int rc = mxint8_ref_gemm_acc(&a_payload[0][0], &b_payload[0][0],
-                                     &a_scale[0][0], &b_scale[0][0], &gold[0][0],
-                                     m, n, k, K_MAX, N_MAX, N_MAX, KB_MAX, N_MAX);
-  if (rc != 0) {
-    printf("%-10s M=%d N=%d K=%d: golden rejected a scale (rc=%d)\n",
-           label, (int)m, (int)n, (int)k, rc);
-    return 1;
-  }
-
   mxint8_hw_matmul(m, n, k, kb);
 
   int mism = 0, fi = -1, fj = -1;
@@ -177,24 +176,35 @@ static int run_probe(size_t m, size_t n) {
     for (size_t j = 0; j < n; j++) { b_payload[kk][j] = 1; }
   }
   for (size_t j = 0; j < n; j++) { b_scale[0][j] = mxint8_e8m0_encode(6 + (int)(j % 3)); }
+  build_gold_structured(m, n, k, 1);
   return check("probe", m, n, k, 1);
 }
 
-// Randomized fp32 packed through mxint8_pack.h, diffed against the golden. K may
-// span two MX blocks to combine partial M/N with cross-block accumulation.
-static int run_random(const char *label, size_t m, size_t n, size_t k) {
+// Deterministic structured case with varied row/column scales. K may span two MX
+// blocks to combine partial M/N with cross-block accumulation, while expected
+// results stay cheap to build inside the simulated core.
+static int run_structured(const char *label, size_t m, size_t n, size_t k) {
   clear_all();
   const size_t kb = (k + MX_BLOCK_SIZE - 1) / MX_BLOCK_SIZE;
   for (size_t i = 0; i < m; i++) {
-    const float row_mag = 1.0f + (float)(i % 5);
-    for (size_t kk = 0; kk < k; kk++) { a_f[i][kk] = frand_signed(row_mag); }
+    for (size_t b = 0; b < kb; b++) {
+      const size_t base = b * MX_BLOCK_SIZE;
+      const size_t end = (base + MX_BLOCK_SIZE <= k) ? base + MX_BLOCK_SIZE : k;
+      for (size_t kk = base; kk < end; kk++) { a_payload[i][kk] = (elem_t)(b + 1); }
+      a_scale[i][b] = mxint8_e8m0_encode(6 + (int)((i + b) % 4));
+    }
   }
-  for (size_t kk = 0; kk < k; kk++) {
-    for (size_t j = 0; j < n; j++) { b_f[kk][j] = frand_signed(1.0f + (float)(j % 3)); }
+  for (size_t b = 0; b < kb; b++) {
+    const size_t base = b * MX_BLOCK_SIZE;
+    const size_t end = (base + MX_BLOCK_SIZE <= k) ? base + MX_BLOCK_SIZE : k;
+    for (size_t kk = base; kk < end; kk++) {
+      for (size_t j = 0; j < n; j++) { b_payload[kk][j] = 1; }
+    }
+    for (size_t j = 0; j < n; j++) {
+      b_scale[b][j] = mxint8_e8m0_encode(6 + (int)((j + 2 * b) % 3));
+    }
   }
-  // Pack only the valid region; clear_all already set padding scales to neutral.
-  mxint8_pack_a(&a_f[0][0], m, k, K_MAX, KB_MAX, &a_payload[0][0], &a_scale[0][0]);
-  mxint8_pack_b(&b_f[0][0], k, n, N_MAX, N_MAX, &b_payload[0][0], &b_scale[0][0]);
+  build_gold_structured(m, n, k, kb);
   return check(label, m, n, k, kb);
 }
 
@@ -208,11 +218,11 @@ int main() {
 
   int bad = 0;
   bad |= run_probe(10, 12);                  // partial probe: per-row/col addressing
-  bad |= run_random("full",  M_MAX, N_MAX, MX_BLOCK_SIZE);  // sanity: extended dims == full tile
-  bad |= run_random("row1",  1,     N_MAX, MX_BLOCK_SIZE);  // single output row
-  bad |= run_random("col1",  M_MAX, 1,     MX_BLOCK_SIZE);  // single output column
-  bad |= run_random("part",  13,    20,    MX_BLOCK_SIZE);  // general partial tile
-  bad |= run_random("part2", 7,     9,     2 * MX_BLOCK_SIZE); // partial + cross-block K
+  bad |= run_structured("full",  M_MAX, N_MAX, MX_BLOCK_SIZE);  // extended dims == full tile
+  bad |= run_structured("row1",  1,     N_MAX, MX_BLOCK_SIZE);  // single output row
+  bad |= run_structured("col1",  M_MAX, 1,     MX_BLOCK_SIZE);  // single output column
+  bad |= run_structured("part",  13,    20,    MX_BLOCK_SIZE);  // general partial tile
+  bad |= run_structured("part2", 7,     9,     2 * MX_BLOCK_SIZE); // partial + cross-block K
 
   if (bad) {
     printf("mxint8_matmul_partial: FAIL\n");

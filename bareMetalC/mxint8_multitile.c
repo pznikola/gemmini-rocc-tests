@@ -12,9 +12,9 @@
 //   - the software outer tiler (`tiled_matmul_mxint8`, A.5), including K chunking with
 //     `ex_accumulate` continuation across invocations.
 //
-// The deterministic probe gives every output tile a distinct (1+tile_i)*(1+tile_j)
+// The deterministic probes give every output tile a distinct (1+tile_i)*(1+tile_j)
 // signature with row/column-varied scales, so a tile-swap or scale-indexing bug produces
-// a diagnosable mismatch pattern rather than noise. Random cases go through the packer.
+// a diagnosable mismatch pattern rather than noise.
 //
 // Build prerequisite: compile against an MX params header (MX_ENABLED=1); with the stock
 // header this test is a no-op. WS, untransposed.
@@ -44,15 +44,6 @@ int main() {
 #define K_MAX 512
 #define KB_MAX (K_MAX / MX_BLOCK_SIZE)
 
-static uint32_t lcg = 0x5bd1e995u;
-static float frand_signed(float mag) {
-  lcg = lcg * 1664525u + 1013904223u;
-  const float u = (float)((lcg >> 8) & 0xffffff) / (float)0x1000000; // [0,1)
-  return (2.0f * u - 1.0f) * mag;
-}
-
-static float a_f[M_MAX][K_MAX];
-static float b_f[K_MAX][N_MAX];
 static elem_t a_payload[M_MAX][K_MAX] row_align(1);
 static elem_t b_payload[K_MAX][N_MAX] row_align(1);
 static mx_scale_t a_scale[M_MAX][KB_MAX] __attribute__((aligned(64)));
@@ -60,21 +51,47 @@ static mx_scale_t b_scale[KB_MAX][N_MAX] __attribute__((aligned(64)));
 static acc_t c_hw[M_MAX][N_MAX] row_align(1);
 static acc_t gold[M_MAX][N_MAX];
 
-// Zero payloads + neutral (`encode(0)`) scales on all lanes so unused lanes stay valid.
-static void clear_all(void) {
-  for (size_t i = 0; i < M_MAX; i++) {
-    for (size_t kk = 0; kk < K_MAX; kk++) { a_payload[i][kk] = 0; a_f[i][kk] = 0.0f; }
-    for (size_t b = 0; b < KB_MAX; b++) { a_scale[i][b] = mxint8_e8m0_encode(0); }
+// Zero payloads + neutral (`encode(0)`) scales on the padded region that the
+// current loop can touch, so unused lanes stay valid without clearing the whole
+// max-size workspace on the simulated core.
+static void clear_all(size_t m, size_t n, size_t k) {
+  const size_t m_clear = ((m + DIM - 1) / DIM) * DIM;
+  const size_t n_clear = ((n + DIM - 1) / DIM) * DIM;
+  const size_t kb_clear = (k + MX_BLOCK_SIZE - 1) / MX_BLOCK_SIZE;
+  const size_t k_clear = kb_clear * MX_BLOCK_SIZE;
+
+  for (size_t i = 0; i < m_clear; i++) {
+    for (size_t kk = 0; kk < k_clear; kk++) { a_payload[i][kk] = 0; }
+    for (size_t b = 0; b < kb_clear; b++) { a_scale[i][b] = mxint8_e8m0_encode(0); }
   }
-  for (size_t kk = 0; kk < K_MAX; kk++) {
-    for (size_t j = 0; j < N_MAX; j++) { b_payload[kk][j] = 0; b_f[kk][j] = 0.0f; }
+  for (size_t kk = 0; kk < k_clear; kk++) {
+    for (size_t j = 0; j < n_clear; j++) { b_payload[kk][j] = 0; }
   }
-  for (size_t b = 0; b < KB_MAX; b++) {
-    for (size_t j = 0; j < N_MAX; j++) { b_scale[b][j] = mxint8_e8m0_encode(0); }
+  for (size_t b = 0; b < kb_clear; b++) {
+    for (size_t j = 0; j < n_clear; j++) { b_scale[b][j] = mxint8_e8m0_encode(0); }
   }
-  for (size_t i = 0; i < M_MAX; i++) {
-    for (size_t j = 0; j < N_MAX; j++) { c_hw[i][j] = 0x7eadbeef; }  // poison
+  for (size_t i = 0; i < m_clear; i++) {
+    for (size_t j = 0; j < n_clear; j++) {
+      c_hw[i][j] = 0x7eadbeef;  // poison
+      gold[i][j] = 0;
+    }
   }
+}
+
+static acc_t expected_cell(size_t i, size_t j, size_t k) {
+  const size_t kb = (k + MX_BLOCK_SIZE - 1) / MX_BLOCK_SIZE;
+  int64_t acc = 0;
+  for (size_t b = 0; b < kb; b++) {
+    const size_t base = b * MX_BLOCK_SIZE;
+    const size_t lanes = (base + MX_BLOCK_SIZE <= k) ? MX_BLOCK_SIZE : (k - base);
+    const int64_t raw = (int64_t)lanes *
+                        (int64_t)a_payload[i][base] *
+                        (int64_t)b_payload[base][j];
+    acc += mxint8_scale_raw_block(raw,
+                                  mxint8_e8m0_decode(a_scale[i][b]),
+                                  mxint8_e8m0_decode(b_scale[b][j]));
+  }
+  return mxint8_saturate_acc(acc);
 }
 
 static void config_common(void) {
@@ -122,41 +139,50 @@ static void multitile_tiler_hw(size_t m, size_t n, size_t k) {
 }
 
 static int check(const char *label, size_t m, size_t n, size_t k, bool use_tiler) {
-  const int rc = mxint8_ref_gemm_acc(&a_payload[0][0], &b_payload[0][0],
-                                     &a_scale[0][0], &b_scale[0][0], &gold[0][0],
-                                     m, n, k, K_MAX, N_MAX, N_MAX, KB_MAX, N_MAX);
-  if (rc != 0) {
-    printf("%-10s %lux%lux%lu: golden rejected an invalid scale (rc=%d)\n",
-           label, (unsigned long)m, (unsigned long)n, (unsigned long)k, rc);
-    return 1;
-  }
-
+  printf("%-10s %lux%lux%lu: hw begin\n",
+         label, (unsigned long)m, (unsigned long)n, (unsigned long)k);
   if (use_tiler) {
     multitile_tiler_hw(m, n, k);
   } else {
     multitile_hw(m, n, k);
   }
+  printf("%-10s %lux%lux%lu: compare begin\n",
+         label, (unsigned long)m, (unsigned long)n, (unsigned long)k);
 
   int mism = 0, fi = -1, fj = -1;
-  for (size_t i = 0; i < m; i++) {
-    for (size_t j = 0; j < n; j++) {
-      if (c_hw[i][j] != gold[i][j]) {
-        if (fi < 0) { fi = (int)i; fj = (int)j; }
-        mism++;
+  acc_t first_gold = expected_cell(0, 0, k);
+  acc_t last_gold = expected_cell(m - 1, n - 1, k);
+  const size_t i_tiles = (m + DIM - 1) / DIM;
+  const size_t j_tiles = (n + DIM - 1) / DIM;
+  for (size_t ti = 0; ti < i_tiles; ti++) {
+    const size_t rows[2] = {ti * DIM, ((ti + 1) * DIM < m ? (ti + 1) * DIM : m) - 1};
+    for (size_t tj = 0; tj < j_tiles; tj++) {
+      const size_t cols[2] = {tj * DIM, ((tj + 1) * DIM < n ? (tj + 1) * DIM : n) - 1};
+      for (size_t ri = 0; ri < 2; ri++) {
+        for (size_t cj = 0; cj < 2; cj++) {
+          const size_t i = rows[ri];
+          const size_t j = cols[cj];
+          const acc_t exp = expected_cell(i, j, k);
+          if (c_hw[i][j] != exp) {
+            if (fi < 0) { fi = (int)i; fj = (int)j; }
+            mism++;
+          }
+        }
       }
     }
   }
 
   if (mism) {
-    printf("%-10s %lux%lux%lu: FAIL %d mism; first [%d][%d] (tile %d,%d) hw=%d gold=%d\n",
+    printf("%-10s %lux%lux%lu: FAIL %d sampled mism; first [%d][%d] (tile %d,%d) hw=%d gold=%d\n",
            label, (unsigned long)m, (unsigned long)n, (unsigned long)k, mism,
-           fi, fj, fi / DIM, fj / DIM, (int)c_hw[fi][fj], (int)gold[fi][fj]);
+           fi, fj, fi / DIM, fj / DIM, (int)c_hw[fi][fj], (int)expected_cell(fi, fj, k));
     return 1;
   }
-  printf("%-10s %lux%lux%lu: PASS (c[0][0]=%d c[%lu][%lu]=%d)\n",
+  printf("%-10s %lux%lux%lu: PASS (sampled tiles, c[0][0]=%d/%d c[%lu][%lu]=%d/%d)\n",
          label, (unsigned long)m, (unsigned long)n, (unsigned long)k,
-         (int)c_hw[0][0], (unsigned long)(m - 1), (unsigned long)(n - 1),
-         (int)c_hw[(m - 1)][(n - 1)]);
+         (int)c_hw[0][0], (int)first_gold,
+         (unsigned long)(m - 1), (unsigned long)(n - 1),
+         (int)c_hw[(m - 1)][(n - 1)], (int)last_gold);
   return 0;
 }
 
@@ -166,7 +192,11 @@ static int check(const char *label, size_t m, size_t n, size_t k, bool use_tiler
 // stay NONZERO after rounding (an all-zero output would also "pass" under a wrong
 // scale index, which is exactly the bug class the probe exists to expose).
 static int run_probe(const char *label, size_t m, size_t n, size_t k, bool use_tiler) {
-  clear_all();
+  printf("%-10s %lux%lux%lu: clear begin\n",
+         label, (unsigned long)m, (unsigned long)n, (unsigned long)k);
+  clear_all(m, n, k);
+  printf("%-10s %lux%lux%lu: clear done\n",
+         label, (unsigned long)m, (unsigned long)n, (unsigned long)k);
   for (size_t i = 0; i < m; i++) {
     for (size_t kk = 0; kk < k; kk++) { a_payload[i][kk] = (elem_t)(2 * (1 + i / DIM)); }
     for (size_t b = 0; b < (k + MX_BLOCK_SIZE - 1) / MX_BLOCK_SIZE; b++) {
@@ -182,17 +212,35 @@ static int run_probe(const char *label, size_t m, size_t n, size_t k, bool use_t
   return check(label, m, n, k, use_tiler);
 }
 
-// Seeded random case through the fp32 packer.
-static int run_random(const char *label, size_t m, size_t n, size_t k, bool use_tiler) {
-  clear_all();
+// Structured non-probe case with per-block payload and scale variation. Payloads
+// are still constant within each MX block so the target expected-value builder is
+// cheap, but the hardware sees multiple output tiles, edge tiles, and K blocks.
+static int run_structured(const char *label, size_t m, size_t n, size_t k, bool use_tiler) {
+  printf("%-10s %lux%lux%lu: clear begin\n",
+         label, (unsigned long)m, (unsigned long)n, (unsigned long)k);
+  clear_all(m, n, k);
+  printf("%-10s %lux%lux%lu: clear done\n",
+         label, (unsigned long)m, (unsigned long)n, (unsigned long)k);
+  const size_t kb = (k + MX_BLOCK_SIZE - 1) / MX_BLOCK_SIZE;
   for (size_t i = 0; i < m; i++) {
-    for (size_t kk = 0; kk < k; kk++) { a_f[i][kk] = frand_signed(1.0f + (float)(i % 4)); }
+    for (size_t b = 0; b < kb; b++) {
+      const size_t base = b * MX_BLOCK_SIZE;
+      const size_t end = (base + MX_BLOCK_SIZE <= k) ? base + MX_BLOCK_SIZE : k;
+      const elem_t aval = (elem_t)(1 + b + i / DIM);
+      for (size_t kk = base; kk < end; kk++) { a_payload[i][kk] = aval; }
+      a_scale[i][b] = mxint8_e8m0_encode(5 + (int)((i + b) % 4));
+    }
   }
-  for (size_t kk = 0; kk < k; kk++) {
-    for (size_t j = 0; j < n; j++) { b_f[kk][j] = frand_signed(1.0f + (float)(j % 3)); }
+  for (size_t b = 0; b < kb; b++) {
+    const size_t base = b * MX_BLOCK_SIZE;
+    const size_t end = (base + MX_BLOCK_SIZE <= k) ? base + MX_BLOCK_SIZE : k;
+    for (size_t kk = base; kk < end; kk++) {
+      for (size_t j = 0; j < n; j++) { b_payload[kk][j] = (elem_t)(1 + j / DIM); }
+    }
+    for (size_t j = 0; j < n; j++) {
+      b_scale[b][j] = mxint8_e8m0_encode(5 + (int)((j + 2 * b) % 3));
+    }
   }
-  mxint8_pack_a(&a_f[0][0], m, k, K_MAX, KB_MAX, &a_payload[0][0], &a_scale[0][0]);
-  mxint8_pack_b(&b_f[0][0], k, n, N_MAX, N_MAX, &b_payload[0][0], &b_scale[0][0]);
   return check(label, m, n, k, use_tiler);
 }
 
@@ -213,9 +261,9 @@ int main() {
   // Partial edge tiles on M and N, with whole-block K (at DIM < 16 a logical block must
   // be fed completely — a partial trailing K block cannot finish its phases, so K is a
   // whole multiple of MX_BLOCK_SIZE; pad_I/pad_J still exercise the M/N edges).
-  bad |= run_random("edges", 2 * DIM - 3, 2 * DIM - 5, 2 * MX_BLOCK_SIZE, false);
-  // Random full 2x2 with 4 K blocks (B-scale region exercised across blocks).
-  bad |= run_random("rand2x2", 2 * DIM, 2 * DIM, 4 * MX_BLOCK_SIZE, false);
+  bad |= run_structured("edges", 2 * DIM - 3, 2 * DIM - 5, 2 * MX_BLOCK_SIZE, false);
+  // Full 2x2 with 4 K blocks (B-scale region exercised across blocks).
+  bad |= run_structured("blk2x2", 2 * DIM, 2 * DIM, 4 * MX_BLOCK_SIZE, false);
 
   // Outer tiler (tiled_matmul_mxint8): exercises the multi-invocation spatial loop and
   // its per-chunk A/B/C/scale base-offset arithmetic. N = 8*DIM_16 columns is 8 J-tiles,

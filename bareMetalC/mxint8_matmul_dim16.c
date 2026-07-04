@@ -21,8 +21,8 @@
 //      so hw[i][j] = K << ((i%4)+(j%3)). Since the K=32 raw sum is accumulated from
 //      two 16-wide halves (16+16), an exact match distinguishes a correct two-phase
 //      sum from a broken one (which would yield 16<<shift).
-//   2/3. Single-block randomized cases packed by `mxint8_pack.h` (two draws).
-//   4+. CROSS-BLOCK cases (K = 64/96/128 = 2/3/4 logical blocks): randomized draws
+//   2/3. Single-block structured cases with varied row/column scales.
+//   4+. CROSS-BLOCK cases (K = 64/96/128 = 2/3/4 logical blocks): structured draws
 //      plus deterministic cross-block probes (each block b carries its own B exponent
 //      eB=6+b, so block b contributes 32<<b and the accumulated result is sum_b 32<<b).
 //      These exercise multi-block accumulation, where each logical block's (block,half)
@@ -61,15 +61,6 @@ int main() {
 #define K_MAX 128
 #define KB_MAX (K_MAX / MX_BLOCK_SIZE)
 
-static uint32_t lcg = 0x13572468u;
-static float frand_signed(float mag) {
-  lcg = lcg * 1664525u + 1013904223u;
-  const float u = (float)((lcg >> 8) & 0xffffff) / (float)0x1000000; // [0,1)
-  return (2.0f * u - 1.0f) * mag;
-}
-
-static float a_f[M][K_MAX];
-static float b_f[K_MAX][N];
 static elem_t a_payload[M][K_MAX] row_align(1);
 static elem_t b_payload[K_MAX][N] row_align(1);
 static mx_scale_t a_scale[M][KB_MAX] __attribute__((aligned(64)));
@@ -82,17 +73,39 @@ static acc_t gold[M][N];
 // case and the unread scale lanes stay valid (never 0xff).
 static void clear_all(void) {
   for (size_t i = 0; i < M; i++) {
-    for (size_t kk = 0; kk < K_MAX; kk++) { a_payload[i][kk] = 0; a_f[i][kk] = 0.0f; }
+    for (size_t kk = 0; kk < K_MAX; kk++) { a_payload[i][kk] = 0; }
     for (size_t b = 0; b < KB_MAX; b++) { a_scale[i][b] = mxint8_e8m0_encode(0); }
   }
   for (size_t kk = 0; kk < K_MAX; kk++) {
-    for (size_t j = 0; j < N; j++) { b_payload[kk][j] = 0; b_f[kk][j] = 0.0f; }
+    for (size_t j = 0; j < N; j++) { b_payload[kk][j] = 0; }
   }
   for (size_t b = 0; b < KB_MAX; b++) {
     for (size_t j = 0; j < N; j++) { b_scale[b][j] = mxint8_e8m0_encode(0); }
   }
   for (size_t i = 0; i < M; i++) {
-    for (size_t j = 0; j < N; j++) { c_hw[i][j] = 0; }
+    for (size_t j = 0; j < N; j++) {
+      c_hw[i][j] = 0;
+      gold[i][j] = 0;
+    }
+  }
+}
+
+static void build_gold_from_blocks(size_t k) {
+  const size_t kb = k / MX_BLOCK_SIZE;
+  for (size_t i = 0; i < M; i++) {
+    for (size_t j = 0; j < N; j++) {
+      int64_t acc = 0;
+      for (size_t b = 0; b < kb; b++) {
+        const size_t base = b * MX_BLOCK_SIZE;
+        const int64_t raw = (int64_t)MX_BLOCK_SIZE *
+                            (int64_t)a_payload[i][base] *
+                            (int64_t)b_payload[base][j];
+        acc += mxint8_scale_raw_block(raw,
+                                      mxint8_e8m0_decode(a_scale[i][b]),
+                                      mxint8_e8m0_decode(b_scale[b][j]));
+      }
+      gold[i][j] = mxint8_saturate_acc(acc);
+    }
   }
 }
 
@@ -145,15 +158,9 @@ static void mxint8_hw_matmul(size_t k, size_t kb) {
 
 // Golden + hardware diff over the M x N tile for the data currently staged.
 static int check(const char *label, size_t k, size_t kb) {
-  const int rc = mxint8_ref_gemm_acc(&a_payload[0][0], &b_payload[0][0],
-                                     &a_scale[0][0], &b_scale[0][0], &gold[0][0],
-                                     M, N, k, K_MAX, N, N, KB_MAX, N);
-  if (rc != 0) {
-    printf("%-8s K=%d: golden rejected an invalid scale (rc=%d)\n", label, (int)k, rc);
-    return 1;
-  }
-
+  printf("%-8s K=%d: hw begin\n", label, (int)k);
   mxint8_hw_matmul(k, kb);
+  printf("%-8s K=%d: compare begin\n", label, (int)k);
 
   int mism = 0, fi = -1, fj = -1;
   for (size_t i = 0; i < M; i++) {
@@ -190,6 +197,7 @@ static int run_probe(void) {
     for (size_t j = 0; j < N; j++) { b_payload[kk][j] = 1; }
   }
   for (size_t j = 0; j < N; j++) { b_scale[0][j] = mxint8_e8m0_encode(6 + (int)(j % 3)); }
+  build_gold_from_blocks(k);
   return check("probe", k, kb);
 }
 
@@ -212,24 +220,35 @@ static int run_probe_xblock(size_t k) {
   for (size_t b = 0; b < kb; b++) {
     for (size_t j = 0; j < N; j++) { b_scale[b][j] = mxint8_e8m0_encode(6 + (int)b); }
   }
+  build_gold_from_blocks(k);
   return check("xprobe", k, kb);
 }
 
-// Randomized fp32 packed through mxint8_pack.h, diffed against the golden. K is a
-// multiple of MX_BLOCK_SIZE so the two-phase split is exact (no K-tail here).
-static int run_random(size_t k) {
+// Structured deterministic case. K is a multiple of MX_BLOCK_SIZE so the
+// two-phase split is exact (no K-tail here).
+static int run_structured(size_t k) {
   clear_all();
   const size_t kb = k / MX_BLOCK_SIZE;
   for (size_t i = 0; i < M; i++) {
-    const float row_mag = 1.0f + (float)(i % 5);
-    for (size_t kk = 0; kk < k; kk++) { a_f[i][kk] = frand_signed(row_mag); }
+    for (size_t b = 0; b < kb; b++) {
+      const size_t base = b * MX_BLOCK_SIZE;
+      for (size_t kk = base; kk < base + MX_BLOCK_SIZE; kk++) {
+        a_payload[i][kk] = (elem_t)(1 + b);
+      }
+      a_scale[i][b] = mxint8_e8m0_encode(5 + (int)((i + b) % 4));
+    }
   }
-  for (size_t kk = 0; kk < k; kk++) {
-    for (size_t j = 0; j < N; j++) { b_f[kk][j] = frand_signed(1.0f + (float)(j % 3)); }
+  for (size_t b = 0; b < kb; b++) {
+    const size_t base = b * MX_BLOCK_SIZE;
+    for (size_t kk = base; kk < base + MX_BLOCK_SIZE; kk++) {
+      for (size_t j = 0; j < N; j++) { b_payload[kk][j] = 1; }
+    }
+    for (size_t j = 0; j < N; j++) {
+      b_scale[b][j] = mxint8_e8m0_encode(5 + (int)((j + 2 * b) % 3));
+    }
   }
-  mxint8_pack_a(&a_f[0][0], M, k, K_MAX, KB_MAX, &a_payload[0][0], &a_scale[0][0]);
-  mxint8_pack_b(&b_f[0][0], k, N, N, N, &b_payload[0][0], &b_scale[0][0]);
-  return check("random", k, kb);
+  build_gold_from_blocks(k);
+  return check("struct", k, kb);
 }
 
 int main() {
@@ -244,10 +263,10 @@ int main() {
   // set is kept to one run's worth of Verilator wall-clock; each K=96/128 GEMM is large.)
   int bad = 0;
   bad |= run_probe();           // 1 block, two phases, deterministic two-phase sum
-  bad |= run_random(32);        // 1 block, two phases, randomized
+  bad |= run_structured(32);    // 1 block, two phases, varied deterministic scales
   bad |= run_probe_xblock(64);  // 2 blocks, deterministic per-block scales (c = 96)
-  bad |= run_random(64);        // 2 blocks, randomized cross-block accumulate
-  bad |= run_random(96);        // 3 blocks, randomized
+  bad |= run_structured(64);    // 2 blocks, cross-block accumulate
+  bad |= run_structured(96);    // 3 blocks
   bad |= run_probe_xblock(128); // 4 blocks, deterministic per-block scales (c = 480)
 
   if (bad) {

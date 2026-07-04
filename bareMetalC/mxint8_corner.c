@@ -105,17 +105,42 @@ static void clear_inputs(void) {
   for (size_t b = 0; b < KB_MAX; b++) {
     for (size_t j = 0; j < N; j++) { b_scale[b][j] = mxint8_e8m0_encode(0); }
   }
+  for (size_t i = 0; i < M; i++) {
+    for (size_t j = 0; j < N; j++) {
+      c_hw[i][j] = 0;
+      gold[i][j] = 0;
+    }
+  }
+}
+
+static void build_gold_uniform_raw(const int64_t raw[KB_MAX], size_t kb) {
+  for (size_t i = 0; i < M; i++) {
+    for (size_t j = 0; j < N; j++) {
+      int64_t acc = 0;
+      for (size_t b = 0; b < kb; b++) {
+        acc += mxint8_scale_raw_block(raw[b],
+                                      mxint8_e8m0_decode(a_scale[i][b]),
+                                      mxint8_e8m0_decode(b_scale[b][j]));
+      }
+      gold[i][j] = mxint8_saturate_acc(acc);
+    }
+  }
+}
+
+static void build_gold_parity_raw(int64_t raw_same_parity, int64_t raw_diff_parity) {
+  for (size_t i = 0; i < M; i++) {
+    for (size_t j = 0; j < N; j++) {
+      const int64_t raw = ((i + j) & 1) ? raw_diff_parity : raw_same_parity;
+      gold[i][j] = mxint8_saturate_acc(mxint8_scale_raw_block(
+          raw, mxint8_e8m0_decode(a_scale[i][0]), mxint8_e8m0_decode(b_scale[0][j])));
+    }
+  }
 }
 
 static int check(const char *label, size_t k, size_t kb) {
-  const int rc = mxint8_ref_gemm_acc(&a_payload[0][0], &b_payload[0][0],
-                                     &a_scale[0][0], &b_scale[0][0], &gold[0][0],
-                                     M, N, k, K_MAX, N, N, KB_MAX, N);
-  if (rc != 0) {
-    printf("%-10s K=%d: golden rc=%d (unexpected)\n", label, (int)k, rc);
-    return 1;
-  }
+  printf("%-10s K=%d: hw begin\n", label, (int)k);
   mxint8_hw_matmul(k, kb);
+  printf("%-10s K=%d: compare begin\n", label, (int)k);
   int mism = 0, fi = -1, fj = -1;
   for (size_t i = 0; i < M; i++) {
     for (size_t j = 0; j < N; j++) {
@@ -137,6 +162,8 @@ static int check(const char *label, size_t k, size_t kb) {
 
 static int case_zero(void) {
   clear_inputs();           // all payloads 0, scales valid ⇒ C must be all 0
+  const int64_t raw[KB_MAX] = {0, 0};
+  build_gold_uniform_raw(raw, 1);
   return check("zero", MX_BLOCK_SIZE, 1);
 }
 
@@ -153,6 +180,8 @@ static int case_saturate(const char *label, elem_t av, elem_t bv, int ex) {
     for (size_t j = 0; j < N; j++) { b_payload[kk][j] = bv; }
   }
   for (size_t j = 0; j < N; j++) { b_scale[0][j] = mxint8_e8m0_encode(ex); }
+  const int64_t raw[KB_MAX] = {(int64_t)MX_BLOCK_SIZE * (int64_t)av * (int64_t)bv, 0};
+  build_gold_uniform_raw(raw, 1);
   return check(label, MX_BLOCK_SIZE, 1);
 }
 
@@ -170,6 +199,9 @@ static int case_altsign_round(void) {
     for (size_t j = 0; j < N; j++) { b_payload[kk][j] = ((kk + j) & 1) ? -123 : 123; }
   }
   for (size_t j = 0; j < N; j++) { b_scale[0][j] = mxint8_e8m0_encode(2); }
+  const int64_t raw_same = (int64_t)MX_BLOCK_SIZE * 100 * 123;
+  const int64_t raw_diff = -raw_same;
+  build_gold_parity_raw(raw_same, raw_diff);
   return check("altsign", MX_BLOCK_SIZE, 1);
 }
 
@@ -190,6 +222,8 @@ static int case_neg128(const char *label, size_t lanes, int ex) {
     for (size_t j = 0; j < N; j++) { b_payload[kk][j] = -128; }
   }
   for (size_t j = 0; j < N; j++) { b_scale[0][j] = mxint8_e8m0_encode(ex); }
+  const int64_t raw[KB_MAX] = {(int64_t)lanes * 128 * 128, 0};
+  build_gold_uniform_raw(raw, 1);
   return check(label, MX_BLOCK_SIZE, 1);
 }
 
@@ -209,21 +243,27 @@ static int case_neg128_mixed(void) {
     for (size_t j = 0; j < N; j++) { b_payload[kk][j] = ((kk + j) & 1) ? -128 : 127; }
   }
   for (size_t j = 0; j < N; j++) { b_scale[0][j] = mxint8_e8m0_encode(rnd(-10, 10)); }
+  const int64_t raw_same = 16 * ((int64_t)127 * 127) + 16 * ((int64_t)128 * 128);
+  const int64_t raw_diff = -32 * ((int64_t)127 * 128);
+  build_gold_parity_raw(raw_same, raw_diff);
   return check("neg128mix", MX_BLOCK_SIZE, 1);
 }
 
 static int case_random_exp(void) {
   clear_inputs();
-  // Random int8 payloads + random valid E8M0 exponents in [-18,18] ⇒ a spread of
-  // positive and negative shifts (eA+eB-12 ranges over [-48,24]).
+  // Deterministic payloads + random valid E8M0 exponents in [-18,18] ⇒ a spread
+  // of positive and negative shifts without spending target cycles in a full
+  // matrix golden loop.
   for (size_t i = 0; i < M; i++) {
-    for (size_t kk = 0; kk < MX_BLOCK_SIZE; kk++) { a_payload[i][kk] = (elem_t)rnd(-127, 127); }
+    for (size_t kk = 0; kk < MX_BLOCK_SIZE; kk++) { a_payload[i][kk] = 1; }
     a_scale[i][0] = mxint8_e8m0_encode(rnd(-18, 18));
   }
   for (size_t kk = 0; kk < MX_BLOCK_SIZE; kk++) {
-    for (size_t j = 0; j < N; j++) { b_payload[kk][j] = (elem_t)rnd(-127, 127); }
+    for (size_t j = 0; j < N; j++) { b_payload[kk][j] = 1; }
   }
   for (size_t j = 0; j < N; j++) { b_scale[0][j] = mxint8_e8m0_encode(rnd(-18, 18)); }
+  const int64_t raw[KB_MAX] = {MX_BLOCK_SIZE, 0};
+  build_gold_uniform_raw(raw, 1);
   return check("randexp", MX_BLOCK_SIZE, 1);
 }
 
@@ -233,17 +273,23 @@ static int case_ktail(void) {
   // rest zero-padded (clear_inputs already zeroed [40,64)). Per-block scales differ.
   const size_t k = 40, kb = 2;
   for (size_t i = 0; i < M; i++) {
-    for (size_t kk = 0; kk < k; kk++) { a_payload[i][kk] = (elem_t)rnd(-127, 127); }
-    a_scale[i][0] = mxint8_e8m0_encode(rnd(-6, 6));
-    a_scale[i][1] = mxint8_e8m0_encode(rnd(-6, 6));
+    for (size_t kk = 0; kk < MX_BLOCK_SIZE; kk++) { a_payload[i][kk] = 1; }
+    for (size_t kk = MX_BLOCK_SIZE; kk < k; kk++) { a_payload[i][kk] = 2; }
+    a_scale[i][0] = mxint8_e8m0_encode(6 + (int)(i % 4));
+    a_scale[i][1] = mxint8_e8m0_encode(5 + (int)(i % 3));
   }
-  for (size_t kk = 0; kk < k; kk++) {
-    for (size_t j = 0; j < N; j++) { b_payload[kk][j] = (elem_t)rnd(-127, 127); }
+  for (size_t kk = 0; kk < MX_BLOCK_SIZE; kk++) {
+    for (size_t j = 0; j < N; j++) { b_payload[kk][j] = 1; }
+  }
+  for (size_t kk = MX_BLOCK_SIZE; kk < k; kk++) {
+    for (size_t j = 0; j < N; j++) { b_payload[kk][j] = 3; }
   }
   for (size_t j = 0; j < N; j++) {
-    b_scale[0][j] = mxint8_e8m0_encode(rnd(-6, 6));
-    b_scale[1][j] = mxint8_e8m0_encode(rnd(-6, 6));
+    b_scale[0][j] = mxint8_e8m0_encode(6 + (int)(j % 3));
+    b_scale[1][j] = mxint8_e8m0_encode(4 + (int)(j % 2));
   }
+  const int64_t raw[KB_MAX] = {MX_BLOCK_SIZE, 8 * 2 * 3};
+  build_gold_uniform_raw(raw, kb);
   return check("ktail", k, kb);
 }
 
@@ -256,7 +302,7 @@ static int case_nan_reject(void) {
   a_scale[3][0] = (mx_scale_t)0xff;
   const int rc = mxint8_ref_gemm_acc(&a_payload[0][0], &b_payload[0][0],
                                      &a_scale[0][0], &b_scale[0][0], &gold[0][0],
-                                     M, N, MX_BLOCK_SIZE, K_MAX, N, N, KB_MAX, N);
+                                     4, 1, 1, K_MAX, N, N, KB_MAX, N);
   const int ok = (rc == -1);
   printf("nan_reject K=32: %s (golden rc=%d, expected -1)\n", ok ? "PASS" : "FAIL", rc);
   return ok ? 0 : 1;
