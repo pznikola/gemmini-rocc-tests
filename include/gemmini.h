@@ -16,6 +16,10 @@
 
 #define GEMMINI_ASSERTIONS
 
+#ifndef MX_BENCH_CPU_TIMING
+#define MX_BENCH_CPU_TIMING 0
+#endif
+
 // Accelerator interface
 #include "rocc-software/src/xcustom.h"
 
@@ -521,9 +525,10 @@ _STATIC void mxint8_repack_b_scales_tiled(const mx_scale_t *b_scale,
   }
 }
 
-// Phase-0c CPU-cost localization (temporary, observation-only): accumulate the host cycles
-// spent in the per-chunk B-scale repack vs the per-chunk gemmini instruction issue, so we can
-// attribute the ~85% accelerator-idle (CPU-bound) time. Read/reset by mx_bench.
+#if MX_BENCH_CPU_TIMING
+// Phase-0c CPU-cost localization (observation-only): accumulate the host cycles
+// spent in the per-chunk B-scale repack vs the per-chunk Gemmini instruction issue.
+// Kept opt-in so normal performance runs do not pay measurement overhead.
 static uint64_t g_mx_repack_cyc = 0;
 static uint64_t g_mx_issue_cyc = 0;
 // Fine-grained per-chunk host-cost partition (observation-only): where do the per-chunk MX host
@@ -535,6 +540,7 @@ static uint64_t g_mx_config_cyc = 0;
 static uint64_t g_mx_scalea_cyc = 0;
 static uint64_t g_mx_scaleb_cyc = 0;
 static inline uint64_t mx_rdcycle_(void) { uint64_t c; __asm__ volatile ("rdcycle %0" : "=r"(c)); return c; }
+#endif
 
 // B-scale tiling reuse (Phase 1 fix). The repacked B-scale image depends only on the
 // (j-chunk, k-chunk), NOT on the output-row chunk i0, yet gemmini_loop_ws_mxint8 re-tiled it
@@ -544,9 +550,7 @@ static inline uint64_t mx_rdcycle_(void) { uint64_t c; __asm__ volatile ("rdcycl
 // repack into the internal ping-pong buffer (all direct callers keep that behavior).
 static mx_scale_t *g_mx_btile_cache = NULL;
 static bool g_mx_btile_valid = false;
-#if DIM >= 32
 static bool g_mx_bscale_resident = false;
-#endif
 
 // Element count of one per-(j,k) tiled B-scale image (the max image, per the
 // k_blocks*jp <= MX_SCALE_SP_ROWS/2 envelope). Used to size both the internal per-chunk
@@ -661,28 +665,40 @@ _STATIC void gemmini_loop_ws_mxint8(size_t I, size_t J, size_t K,
   // self-cycles via k_blocks and each chunk owns a scale-SRAM ping-pong half, so consecutive
   // chunks pipeline; the caller fences only on parity reuse / geometry change (fence_first).
   if (fence_first) {
+#if MX_BENCH_CPU_TIMING
     const uint64_t _fn0 = mx_rdcycle_();
+#endif
     gemmini_fence();
+#if MX_BENCH_CPU_TIMING
     g_mx_fence_cyc += mx_rdcycle_() - _fn0;
+#endif
   }
 
+#if MX_BENCH_CPU_TIMING
   const uint64_t _cf0 = mx_rdcycle_();
+#endif
   gemmini_config_mxint8_tiled(true, 0, I, J, log2_jp,
                               (pipeline_parity >= 0) ? k_blocks : (size_t)0,
                               /*reset_k=*/fence_first);
+#if MX_BENCH_CPU_TIMING
   g_mx_config_cyc += mx_rdcycle_() - _cf0;
+#endif
+#if MX_BENCH_CPU_TIMING
   const uint64_t _sa0 = mx_rdcycle_();
+#endif
   gemmini_mvin_mxscale_a(A_scale, mxint8_pp_off, m_rows, k_blocks, A_scale_stride);
+#if MX_BENCH_CPU_TIMING
   g_mx_scalea_cyc += mx_rdcycle_() - _sa0;
+#endif
 
   // B scales: load the padded tiled image (one SRAM row per (kb, tile_j) pair) into this
   // chunk's ping-pong half. When the dense host layout already is that image (full tiles,
   // dense stride, power-of-two J), load it directly; otherwise repack on the host first.
   const size_t b_scale_addr = MX_SCALE_SP_ROWS / 2 + mxint8_pp_off;
+#if MX_BENCH_CPU_TIMING
   const uint64_t _sb0 = mx_rdcycle_();
-#if DIM >= 32
-  if (!g_mx_bscale_resident) {
 #endif
+  if (!g_mx_bscale_resident) {
     if (n_cols == jp * DIM && B_scale_stride == n_cols) {
       gemmini_mvin_mxscale_b(B_scale, b_scale_addr, k_blocks * jp, DIM, DIM);
     } else {
@@ -691,27 +707,35 @@ _STATIC void gemmini_loop_ws_mxint8(size_t I, size_t J, size_t K,
       mx_scale_t *btile = (g_mx_btile_cache != NULL) ? g_mx_btile_cache
                                                      : mxint8_b_scale_tiled[mxint8_pp_buf];
       if (!(g_mx_btile_cache != NULL && g_mx_btile_valid)) {
+#if MX_BENCH_CPU_TIMING
         const uint64_t _rp0 = mx_rdcycle_();
+#endif
         mxint8_repack_b_scales_tiled(B_scale, k_blocks, n_cols, B_scale_stride, jp, btile);
+#if MX_BENCH_CPU_TIMING
         g_mx_repack_cyc += mx_rdcycle_() - _rp0;
+#endif
         if (g_mx_btile_cache != NULL) g_mx_btile_valid = true;
       }
       gemmini_mvin_mxscale_b(btile, b_scale_addr, k_blocks * jp, DIM, DIM);
     }
-#if DIM >= 32
   }
-#endif
+#if MX_BENCH_CPU_TIMING
   g_mx_scaleb_cyc += mx_rdcycle_() - _sb0;  // pure mvin issue (repack skipped on the pretiled path)
+#endif
 
   if (!setup_only) {
+#if MX_BENCH_CPU_TIMING
     const uint64_t _is0 = mx_rdcycle_();
+#endif
     gemmini_loop_ws_mx(I, J, K, pad_I, pad_J, pad_K,
                        A_payload, B_payload, D, C,
                        A_stride, B_stride, D_stride, C_stride,
                        A_transpose, B_transpose,
                        full_C, low_D, ex_accumulate, act,
                        a_spad_id, b_spad_id, is_resadd, log2_jp);
+#if MX_BENCH_CPU_TIMING
     g_mx_issue_cyc += mx_rdcycle_() - _is0;
+#endif
   }
 }
 
@@ -896,9 +920,7 @@ _STATIC void tiled_matmul_mxint8_impl(size_t M, size_t N, size_t K,
   // validity forced true — no repack ever happens inside the (timed) loop.
   static mx_scale_t mx_btile_cache[4][MX_PRETILE_SLOT_ELEMS];
   static bool mx_btile_valid[4];
-#if DIM >= 32
   static bool mx_bscale_resident[4][2];
-#endif
   const bool mx_use_btile_cache = (b_pretiled != NULL) || (mx_JC * mx_KC <= 4);
   if (b_pretiled == NULL && mx_use_btile_cache) {
     for (size_t t = 0; t < mx_JC * mx_KC; t++) mx_btile_valid[t] = false;
@@ -914,17 +936,144 @@ _STATIC void tiled_matmul_mxint8_impl(size_t M, size_t N, size_t K,
   const size_t mx_IC = (i_tiles + i_chunk - 1) / i_chunk;
   const bool mx_b_reuse = (mx_JC * mx_KC <= 2);
   const bool mx_a_reuse = (mx_JC > 1);
-#if DIM >= 32
-  const bool mx_use_bscale_residency = mx_b_reuse && mx_use_btile_cache &&
-      (mx_JC * mx_KC <= 4) && (mx_IC > 2) && !k_chunked;
+  // J03 DIM16 large-shape schedule: when four J chunks are present but only
+  // two B resident regions exist, process two J chunks as a group across the
+  // full I sweep. This trades extra A loads for many fewer B loads and leaves
+  // DIM32 and all K-chunked/tail geometries on the original order.
+  const bool mx_pairj_b_reuse = (DIM < MX_BLOCK_SIZE) && !k_chunked &&
+      (mx_JC == 4) && (mx_KC == 1) &&
+      (j_tiles == mx_JC * j_chunk) && (i_tiles == mx_IC * i_chunk);
+  const size_t mx_pairj_width = 2;
+  const bool mx_effective_b_reuse = mx_b_reuse || mx_pairj_b_reuse;
+  const bool mx_bscale_residency_enough_i =
+      (DIM < MX_BLOCK_SIZE) ? (mx_IC >= 2) : (mx_IC > 2);
+  const bool mx_use_bscale_residency = mx_effective_b_reuse && mx_use_btile_cache &&
+      (mx_JC * mx_KC <= 4) && mx_bscale_residency_enough_i && !k_chunked;
   if (mx_use_bscale_residency) {
     for (size_t t = 0; t < 4; t++) {
       mx_bscale_resident[t][0] = false;
       mx_bscale_resident[t][1] = false;
     }
   }
-#endif
 
+  if (mx_pairj_b_reuse) {
+  const size_t mx_total_chunks = mx_IC * mx_JC * mx_KC;
+  for (size_t mx_seq = 0; mx_seq < mx_total_chunks; mx_seq++) {
+    size_t mx_ic = 0, mx_jc = 0, mx_kc = 0, mx_pair_local_j = 0;
+    bool mx_pair_group_start = false;
+
+    if (mx_pairj_b_reuse) {
+      const size_t chunks_per_pair_group = mx_IC * mx_pairj_width * mx_KC;
+      const size_t pair_group = mx_seq / chunks_per_pair_group;
+      const size_t pair_rem = mx_seq % chunks_per_pair_group;
+      mx_ic = pair_rem / (mx_pairj_width * mx_KC);
+      const size_t pair_inner = pair_rem % (mx_pairj_width * mx_KC);
+      mx_pair_local_j = pair_inner / mx_KC;
+      mx_kc = pair_inner % mx_KC;
+      mx_jc = pair_group * mx_pairj_width + mx_pair_local_j;
+      mx_pair_group_start = (mx_ic == 0 && mx_pair_local_j == 0 && mx_kc == 0);
+    } else {
+      mx_ic = mx_seq / (mx_JC * mx_KC);
+      const size_t rem = mx_seq % (mx_JC * mx_KC);
+      mx_jc = rem / mx_KC;
+      mx_kc = rem % mx_KC;
+    }
+
+    const size_t i0 = mx_ic * i_chunk;
+    const size_t j0 = mx_jc * j_chunk;
+    const size_t k0 = mx_kc * k_chunk;
+    const size_t it = (i0 + i_chunk <= i_tiles) ? i_chunk : (i_tiles - i0);
+    const size_t pad_i = (i0 + it) * DIM > M ? (i0 + it) * DIM - M : 0;
+
+    const size_t jt = (j0 + j_chunk <= j_tiles) ? j_chunk : (j_tiles - j0);
+    const size_t pad_j = (j0 + jt) * DIM > N ? (j0 + jt) * DIM - N : 0;
+
+    const size_t kt = (k0 + k_chunk <= k_tiles) ? k_chunk : (k_tiles - k0);
+    const size_t pad_k = (k0 + kt) * DIM > K ? (k0 + kt) * DIM - K : 0;
+    const size_t kb0 = (k0 * DIM) / MX_BLOCK_SIZE;
+    const bool first_k = k0 == 0;
+    const bool last_k = k0 + kt >= k_tiles;
+
+    const void *d_chunk = (first_k && D != NULL)
+        ? (const void *)((const int8_t *)D + (i0 * DIM * D_stride + j0 * DIM) * sizeof_d)
+        : NULL;
+    void *c_chunk = last_k
+        ? (void *)((int8_t *)C + (i0 * DIM * C_stride + j0 * DIM) * sizeof_c)
+        : NULL;
+
+    // Depth-2 fenceless pairing: even chunks start a pair (fence + RESET_K, parity 0),
+    // the next same-geometry chunk pipelines fenceless on parity 1 (own scale-SRAM half).
+    // (A deferred-run variant that issued both LOOP_WS back-to-back was tried and made it
+    // worse: the chunks still do not overlap — single drain walk + one BlockScaleUnit —
+    // and spad_id 1/2 only added load traffic. So pairing stays per-chunk; see
+    // PERF_ANALYSIS.md "deferred pairing".)
+    const bool geom_same = (it == prev_it && jt == prev_jt && kt == prev_kt);
+    const bool do_fence = k_chunked || first_chunk || !geom_same;
+    // Continuous ping-pong parity: 0 on a fenced (walk-reset) chunk, then alternating
+    // 1,0,1,0... for the fenceless run. The HW credit interlock (2 halves) throttles a
+    // reused half, so no fence is needed to bound the pipeline depth.
+    const int pp = do_fence ? 0 : (int)(since_fence % 2);
+
+    // Point gemmini_loop_ws_mxint8 at this (jc,kc)'s cached tiled B-scale image so it
+    // repacks only on the first i0 and reuses it thereafter. With b_pretiled the image is
+    // already valid (filled offline), so no repack happens at all.
+    size_t mx_slot = 0;
+    int pp_idx = (pp == 1) ? 1 : 0;
+    if (mx_use_btile_cache) {
+      mx_slot = mx_jc * mx_KC + mx_kc;
+      if (b_pretiled != NULL) {
+        g_mx_btile_cache = (mx_scale_t *)(b_pretiled + mx_slot * MX_PRETILE_SLOT_ELEMS);
+        g_mx_btile_valid = true;
+      } else {
+        g_mx_btile_cache = mx_btile_cache[mx_slot];
+        g_mx_btile_valid = mx_btile_valid[mx_slot];
+      }
+    } else {
+      g_mx_btile_cache = NULL;
+    }
+
+    // Operand reuse (chunk indices). a_spad_id/b_spad_id pick the resident scratchpad region
+    // (1/2); passing a NULL payload skips its re-mvin so the resident tile is reused. A is
+    // reused across the active j-sweep (loaded per (ic,kc)), B across the i-sweep when all
+    // active B chunks fit the two resident regions. When a chunk is the operand's first use,
+    // the payload pointer stays non-NULL (it must be loaded); NULL only on a genuine reuse.
+    const int a_sid = mx_a_reuse ? (1 + (int)((mx_ic + mx_kc) & 1)) : 0;
+    const int b_sid = mx_b_reuse
+        ? (((mx_jc + mx_kc) == 0) ? 1 : 2)
+        : (mx_pairj_b_reuse ? (1 + (int)((mx_pair_local_j + mx_kc) & 1)) : 0);
+    const bool mx_b_reuse_active = mx_b_reuse || mx_pairj_b_reuse;
+    const bool mx_a_reuse_hit = mx_a_reuse &&
+        (mx_pairj_b_reuse ? (mx_pair_local_j >= 1) : (mx_jc >= 1));
+    const elem_t *a_ptr = A_payload + i0 * DIM * A_stride + k0 * DIM;
+    const elem_t *b_ptr = B_payload + k0 * DIM * B_stride + j0 * DIM;
+    if (mx_a_reuse_hit) a_ptr = NULL;       // A(ic,kc) resident from prior active jc
+    if (mx_b_reuse_active && mx_ic >= 1) b_ptr = NULL;  // B(jc,kc) resident from ic==0
+    g_mx_bscale_resident = mx_use_bscale_residency &&
+        mx_bscale_resident[mx_slot][pp_idx];
+
+    gemmini_loop_ws_mxint8(it, jt, kt, pad_i, pad_j, pad_k,
+        a_ptr,
+        b_ptr,
+        d_chunk, c_chunk,
+        A_scale + i0 * DIM * A_scale_stride + kb0,
+        B_scale + kb0 * B_scale_stride + j0 * DIM,
+        A_stride, B_stride, D_stride, C_stride,
+        A_scale_stride, B_scale_stride,
+        false, false, full_C, low_D,
+        /*ex_accumulate=*/!first_k, act,
+        /*a_spad_id=*/a_sid, /*b_spad_id=*/b_sid, /*is_resadd=*/false,
+        /*pipeline_parity=*/pp, /*fence_first=*/do_fence, /*setup_only=*/false);
+
+    if (mx_use_bscale_residency) mx_bscale_resident[mx_slot][pp_idx] = true;
+    if (mx_use_btile_cache && b_pretiled == NULL) mx_btile_valid[mx_slot] = g_mx_btile_valid;
+    g_mx_btile_cache = NULL;  // restore default for any other (direct) callers
+    g_mx_bscale_resident = false;
+
+    since_fence = do_fence ? 1 : (since_fence + 1);
+    first_chunk = false;
+    prev_it = it; prev_jt = jt; prev_kt = kt;
+  }
+  } else {
   for (size_t i0 = 0; i0 < i_tiles; i0 += i_chunk) {
     const size_t it = (i0 + i_chunk <= i_tiles) ? i_chunk : (i_tiles - i0);
     const size_t pad_i = (i0 + it) * DIM > M ? (i0 + it) * DIM - M : 0;
@@ -990,10 +1139,8 @@ _STATIC void tiled_matmul_mxint8_impl(size_t M, size_t N, size_t K,
         const elem_t *b_ptr = B_payload + k0 * DIM * B_stride + j0 * DIM;
         if (mx_a_reuse && mx_jc >= 1) a_ptr = NULL;  // A(ic,kc) already resident from jc==0
         if (mx_b_reuse && mx_ic >= 1) b_ptr = NULL;  // B(jc,kc) already resident from ic==0
-#if DIM >= 32
         g_mx_bscale_resident = mx_use_bscale_residency &&
             mx_bscale_resident[mx_slot][pp_idx];
-#endif
 
         gemmini_loop_ws_mxint8(it, jt, kt, pad_i, pad_j, pad_k,
             a_ptr,
@@ -1008,20 +1155,17 @@ _STATIC void tiled_matmul_mxint8_impl(size_t M, size_t N, size_t K,
             /*a_spad_id=*/a_sid, /*b_spad_id=*/b_sid, /*is_resadd=*/false,
             /*pipeline_parity=*/pp, /*fence_first=*/do_fence, /*setup_only=*/false);
 
-#if DIM >= 32
         if (mx_use_bscale_residency) mx_bscale_resident[mx_slot][pp_idx] = true;
-#endif
         if (mx_use_btile_cache && b_pretiled == NULL) mx_btile_valid[mx_slot] = g_mx_btile_valid;
         g_mx_btile_cache = NULL;  // restore default for any other (direct) callers
-#if DIM >= 32
         g_mx_bscale_resident = false;
-#endif
 
         since_fence = do_fence ? 1 : (since_fence + 1);
         first_chunk = false;
         prev_it = it; prev_jt = jt; prev_kt = kt;
       }
     }
+  }
   }
 }
 

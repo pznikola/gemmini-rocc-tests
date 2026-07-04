@@ -19,7 +19,7 @@
 #define MX_SCALE_BITS 8
 #define MX_INT_FRAC_BITS 6
 #define MX_SCALE_EXP_BITS 9
-#define MX_SCALE_SP_ROWS 512
+#define MX_SCALE_SP_ROWS 256
 #define MX_SCALE_ROW_BYTES ((DIM * MX_SCALE_BITS) / 8)
 
 typedef int8_t elem_t;

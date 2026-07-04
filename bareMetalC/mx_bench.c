@@ -39,6 +39,12 @@
 #define MX_BENCH_COUNTER_SET 0
 #endif
 
+static inline uint64_t read_insts(void) {
+  uint64_t c;
+  __asm__ volatile ("rdinstret %0" : "=r"(c));
+  return c;
+}
+
 // Shape limits (bytes are dominated by B and C for the BERT shapes).
 // Known-good array sizing (matches the original suite). Tight 64-strides deadlocked the MX
 // gemm (separate non-square/KB issue), so keep the original 256 strides for the trace.
@@ -124,41 +130,94 @@ static void print_mx_geom(size_t m, size_t n, size_t k) {
   const bool mx_b_reuse = (g.mx_JC * g.mx_KC <= 2);
   const bool mx_a_reuse = (g.mx_JC > 1);
   const bool k_chunked = (g.k_chunk < g.k_tiles);
+  const bool mx_pairj_b_reuse = (DIM < MX_BLOCK_SIZE) && !k_chunked &&
+      (g.mx_JC == 4) && (g.mx_KC == 1) &&
+      (g.j_tiles == g.mx_JC * g.j_chunk) && (g.i_tiles == mx_IC * g.i_chunk);
+  const size_t mx_pairj_width = 2;
+  const bool mx_effective_b_reuse = mx_b_reuse || mx_pairj_b_reuse;
+  const bool mx_bscale_residency_enough_i =
+      (DIM < MX_BLOCK_SIZE) ? (mx_IC >= 2) : (mx_IC > 2);
+  const bool mx_use_bscale_residency = mx_effective_b_reuse &&
+      (g.mx_JC * g.mx_KC <= 4) && mx_bscale_residency_enough_i && !k_chunked;
 
   size_t chunks = 0;
   size_t fences = 0;
   size_t a_payload_loads = 0;
   size_t b_payload_loads = 0;
+  size_t a_scale_loads = 0;
+  size_t b_scale_loads = 0;
+  bool mx_bscale_resident[4][2] = {{false}};
   bool first_chunk = true;
+  size_t since_fence = 0;
   size_t prev_it = 0, prev_jt = 0, prev_kt = 0;
 
-  for (size_t i0 = 0; i0 < g.i_tiles; i0 += g.i_chunk) {
-    const size_t it = (i0 + g.i_chunk <= g.i_tiles) ? g.i_chunk : (g.i_tiles - i0);
-    for (size_t j0 = 0; j0 < g.j_tiles; j0 += g.j_chunk) {
-      const size_t jt = (j0 + g.j_chunk <= g.j_tiles) ? g.j_chunk : (g.j_tiles - j0);
-      for (size_t k0 = 0; k0 < g.k_tiles; k0 += g.k_chunk) {
-        const size_t kt = (k0 + g.k_chunk <= g.k_tiles) ? g.k_chunk : (g.k_tiles - k0);
-        const size_t mx_ic = i0 / g.i_chunk, mx_jc = j0 / g.j_chunk;
-        const bool geom_same = (it == prev_it && jt == prev_jt && kt == prev_kt);
-        const bool do_fence = k_chunked || first_chunk || !geom_same;
-        const bool load_a = !(mx_a_reuse && mx_jc >= 1);
-        const bool load_b = !(mx_b_reuse && mx_ic >= 1);
+  const size_t total_chunks = mx_pairj_b_reuse
+      ? (mx_IC * g.mx_JC * g.mx_KC)
+      : ((g.i_tiles + g.i_chunk - 1) / g.i_chunk) *
+        ((g.j_tiles + g.j_chunk - 1) / g.j_chunk) *
+        ((g.k_tiles + g.k_chunk - 1) / g.k_chunk);
 
-        chunks++;
-        if (do_fence) fences++;
-        if (load_a) a_payload_loads++;
-        if (load_b) b_payload_loads++;
+  for (size_t seq = 0; seq < total_chunks; seq++) {
+    size_t mx_ic = 0, mx_jc = 0, mx_kc = 0, mx_pair_local_j = 0;
+    bool mx_pair_group_start = false;
 
-        first_chunk = false;
-        prev_it = it; prev_jt = jt; prev_kt = kt;
-      }
+    if (mx_pairj_b_reuse) {
+      const size_t chunks_per_pair_group = mx_IC * mx_pairj_width * g.mx_KC;
+      const size_t pair_group = seq / chunks_per_pair_group;
+      const size_t pair_rem = seq % chunks_per_pair_group;
+      mx_ic = pair_rem / (mx_pairj_width * g.mx_KC);
+      const size_t pair_inner = pair_rem % (mx_pairj_width * g.mx_KC);
+      mx_pair_local_j = pair_inner / g.mx_KC;
+      mx_kc = pair_inner % g.mx_KC;
+      mx_jc = pair_group * mx_pairj_width + mx_pair_local_j;
+      mx_pair_group_start = (mx_ic == 0 && mx_pair_local_j == 0 && mx_kc == 0);
+    } else {
+      mx_ic = seq / (g.mx_JC * g.mx_KC);
+      const size_t rem = seq % (g.mx_JC * g.mx_KC);
+      mx_jc = rem / g.mx_KC;
+      mx_kc = rem % g.mx_KC;
     }
+
+    const size_t i0 = mx_ic * g.i_chunk;
+    const size_t j0 = mx_jc * g.j_chunk;
+    const size_t k0 = mx_kc * g.k_chunk;
+    const size_t it = (i0 + g.i_chunk <= g.i_tiles) ? g.i_chunk : (g.i_tiles - i0);
+    const size_t jt = (j0 + g.j_chunk <= g.j_tiles) ? g.j_chunk : (g.j_tiles - j0);
+    const size_t kt = (k0 + g.k_chunk <= g.k_tiles) ? g.k_chunk : (g.k_tiles - k0);
+    const bool geom_same = (it == prev_it && jt == prev_jt && kt == prev_kt);
+    const bool pair_group_barrier = mx_pairj_b_reuse && mx_pair_group_start && mx_jc != 0;
+    const bool do_fence = k_chunked || first_chunk || !geom_same || pair_group_barrier;
+    const int pp = do_fence ? 0 : (int)(since_fence % 2);
+    const int pp_idx = (pp == 1) ? 1 : 0;
+    const size_t mx_slot = mx_jc * g.mx_KC + mx_kc;
+    const bool mx_a_reuse_hit = mx_a_reuse &&
+        (mx_pairj_b_reuse ? (mx_pair_local_j >= 1) : (mx_jc >= 1));
+    const bool mx_b_reuse_active = mx_b_reuse || mx_pairj_b_reuse;
+    const bool load_a = !mx_a_reuse_hit;
+    const bool load_b = !(mx_b_reuse_active && mx_ic >= 1);
+    const bool bscale_hit = mx_use_bscale_residency &&
+        (mx_slot < 4) && mx_bscale_resident[mx_slot][pp_idx];
+
+    chunks++;
+    if (do_fence) fences++;
+    if (load_a) a_payload_loads++;
+    if (load_b) b_payload_loads++;
+    a_scale_loads++;
+    if (!bscale_hit) b_scale_loads++;
+    if (mx_use_bscale_residency && mx_slot < 4) {
+      mx_bscale_resident[mx_slot][pp_idx] = true;
+    }
+
+    since_fence = do_fence ? 1 : (since_fence + 1);
+    first_chunk = false;
+    prev_it = it; prev_jt = jt; prev_kt = kt;
   }
 
   printf("MXGEOM,dim=%d,M=%lu,N=%lu,K=%lu,i_tiles=%lu,j_tiles=%lu,k_tiles=%lu,"
          "i_chunk=%lu,j_chunk=%lu,k_chunk=%lu,mx_IC=%lu,mx_JC=%lu,mx_KC=%lu,"
          "chunks=%lu,fences=%lu,a_reuse=%u,b_reuse=%u,a_payload_loads=%lu,"
-         "b_payload_loads=%lu,a_scale_loads=%lu,b_scale_loads=%lu,k_chunked=%u\n",
+         "b_payload_loads=%lu,a_scale_loads=%lu,b_scale_loads=%lu,k_chunked=%u,"
+         "pairj_reuse=%u,bscale_residency=%u\n",
          DIM, (unsigned long)m, (unsigned long)n, (unsigned long)k,
          (unsigned long)g.i_tiles, (unsigned long)g.j_tiles, (unsigned long)g.k_tiles,
          (unsigned long)g.i_chunk, (unsigned long)g.j_chunk, (unsigned long)g.k_chunk,
@@ -166,7 +225,9 @@ static void print_mx_geom(size_t m, size_t n, size_t k) {
          (unsigned long)chunks, (unsigned long)fences,
          mx_a_reuse ? 1u : 0u, mx_b_reuse ? 1u : 0u,
          (unsigned long)a_payload_loads, (unsigned long)b_payload_loads,
-         (unsigned long)chunks, (unsigned long)chunks, k_chunked ? 1u : 0u);
+         (unsigned long)a_scale_loads, (unsigned long)b_scale_loads,
+         k_chunked ? 1u : 0u, mx_pairj_b_reuse ? 1u : 0u,
+         mx_use_bscale_residency ? 1u : 0u);
 }
 #endif
 
@@ -303,9 +364,11 @@ static int run_shape(const bench_shape_t *s) {
   counter_configure(6, MX_DBG_NO_CMD_CYCLE);                // EX controller starved
   counter_configure(7, RDMA_ACTIVE_CYCLE);                  // read-DMA engine active (reference)
 #endif
-#if MX_ENABLED
+#if MX_ENABLED && MX_BENCH_CPU_TIMING
   g_mx_repack_cyc = 0; g_mx_issue_cyc = 0;  // Phase-0c CPU-cost localization
   g_mx_fence_cyc = 0; g_mx_config_cyc = 0; g_mx_scalea_cyc = 0; g_mx_scaleb_cyc = 0;
+#endif
+#if MX_ENABLED
   // Phase C: pre-tile the constant B-scales ONCE here (untimed). This calls the repack
   // directly (not the timed wrapper), so g_mx_repack_cyc stays 0; the timed GEMM below reads
   // b_pretiled and never repacks. Bytes are identical to the in-loop repack -> bit-exact.
@@ -317,9 +380,15 @@ static int run_shape(const bench_shape_t *s) {
   printf("TRACE,pre_run_gemm,M=%lu\n", (unsigned long)s->m);
   // Reset AFTER the untimed pretile so every counter aligns to the timed GEMM window.
   counter_reset();
+#if MX_BENCH_COUNTER_SET == 3
+  const uint64_t inst_start = read_insts();
+#endif
   const uint64_t start = read_cycles();
   run_gemm(s->m, s->n, s->k);
   const uint64_t end = read_cycles();
+#if MX_BENCH_COUNTER_SET == 3
+  const uint64_t inst_end = read_insts();
+#endif
   printf("TRACE,post_run_gemm,M=%lu\n", (unsigned long)s->m);
   // run_gemm() already includes the completion fence that defines the timed window.
   printf("TRACE,pre_counter_read,M=%lu\n", (unsigned long)s->m);
@@ -378,6 +447,20 @@ static int run_shape(const bench_shape_t *s) {
 #endif
          DIM, (unsigned long)s->m, (unsigned long)s->n, (unsigned long)s->k,
          (unsigned long long)cycles, c0, c1, c2, c3, c4, c5, c6, c7);
+#elif MX_BENCH_COUNTER_SET == 3
+  const uint64_t instret = inst_end - inst_start;
+  const uint64_t cyc_per_inst_x1000 = instret ? (cycles * 1000ULL) / instret : 0;
+  printf("MXINST,impl=%s,dim=%d,M=%lu,N=%lu,K=%lu,cycles=%llu,"
+         "instret=%llu,cyc_per_inst_x1000=%llu,matmul_in_progress=%u,"
+         "loopmm_active=%u,no_cmd=%u,rdma_active=%u\n",
+#if MX_ENABLED
+         "mx",
+#else
+         "stock",
+#endif
+         DIM, (unsigned long)s->m, (unsigned long)s->n, (unsigned long)s->k,
+         (unsigned long long)cycles, (unsigned long long)instret,
+         (unsigned long long)cyc_per_inst_x1000, c0, c1, c6, c7);
 #else
   printf("MXCOUNT,impl=%s,dim=%d,M=%lu,N=%lu,K=%lu,cycles=%llu,matmul_in_progress=%u,"
          "loopmm_active=%u,spadA_wait=%u,spadB_wait=%u,overlap_haz=%u,preload_haz=%u,"
@@ -390,7 +473,7 @@ static int run_shape(const bench_shape_t *s) {
          DIM, (unsigned long)s->m, (unsigned long)s->n, (unsigned long)s->k,
          (unsigned long long)cycles, c0, c1, c2, c3, c4, c5, c6, c7);
 #endif
-#if MX_ENABLED
+#if MX_ENABLED && MX_BENCH_CPU_TIMING
   printf("MXCPU,impl=mx,dim=%d,M=%lu,N=%lu,K=%lu,cycles=%llu,repack_cyc=%llu,issue_cyc=%llu,"
          "fence_cyc=%llu,config_cyc=%llu,scalea_cyc=%llu,scaleb_cyc=%llu\n",
          DIM, (unsigned long)s->m, (unsigned long)s->n, (unsigned long)s->k,
